@@ -472,6 +472,10 @@ var testCases = []struct {
 	{"TestConnection_FaultyOnDrain", "unitary", false, TestConnection_FaultyOnDrain},
 	{"TestConnection_FaultyOnDrainInStatement", "unitary", false, TestConnection_FaultyOnDrainInStatement},
 	{"TestClobExecutor_WriteNCLOB", "unitary", false, TestClobExecutor_WriteNCLOB},
+	{"TestBlobExecutor_CreateTemporaryLob", "unitary", false, TestBlobExecutor_CreateTemporaryLob},
+	{"TestBlobExecutor_Write", "unitary", false, TestBlobExecutor_Write},
+	{"TestBlobExecutor_Read", "unitary", false, TestBlobExecutor_Read},
+	{"TestBlobExecutor_Errors", "unitary", false, TestBlobExecutor_Errors},
 
 	{"TestConnection_InvalidateOnOEROrSTA", "unitary", false, TestConnection_InvalidateOnOEROrSTA},
 	{"TestTransactionCommitSuccess", "unitary", false, TestTransactionCommitSuccess},

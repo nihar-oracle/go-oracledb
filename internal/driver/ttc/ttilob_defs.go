@@ -421,7 +421,9 @@ func NewLobDefinitionForIsOpenOperation(sourceLocator *locator, operation lobOpe
 //   - lobType: indicates the kind of temporary LOB (BLOB/CLOB/NCLOB) via destinationOffset.
 //   - duration: life span of the temporary LOB, marshaled both in destinationLength and lobAmt.
 //   - cache: whether the temporary LOB should be cached on the server (affects lobscn).
-//   - charsetID: character set identifier to apply when dealing with text payloads.
+//   - charsetID: character set identifier for text LOBs, or a non-zero protocol
+//     placeholder when OLOBOPS requires a charset pointer for a binary LOB. A
+//     zero value omits the charset pointer.
 //
 // Returns:
 //   - *lobDefinition: structure that provisions temporary-locator buffers and encodes
