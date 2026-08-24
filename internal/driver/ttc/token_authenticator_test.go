@@ -25,13 +25,20 @@ func (m mockTokenAuthenticationProvider) Token(context.Context) (string, error) 
 	return m.token, m.err
 }
 
-type mockOCITokenAuthenticationProvider struct {
+type mockSignedTokenAuthenticationProvider struct {
 	mockTokenAuthenticationProvider
 	privateKey    []byte
 	privateKeyErr error
+	tokenSeen     *string
 }
 
-func (m mockOCITokenAuthenticationProvider) PrivateKey(context.Context) ([]byte, error) {
+func (m mockSignedTokenAuthenticationProvider) PrivateKeyForToken(
+	_ context.Context,
+	token string,
+) ([]byte, error) {
+	if m.tokenSeen != nil {
+		*m.tokenSeen = token
+	}
 	return m.privateKey, m.privateKeyErr
 }
 
@@ -55,15 +62,14 @@ func newTestProviderRegistry(providersToRegister ...oracleProviders.Provider) co
 	return registry
 }
 
-func TestGetAuthenticator_UsesTokenAuthenticatorForOCIToken(t *testing.T) {
+func TestGetAuthenticator_UsesTokenAuthenticatorForSignedToken(t *testing.T) {
 	t.Parallel()
 
 	cfg := oracleconfig.NewOracleDriverConfig()
 	cfg.ConnectDescriptor = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=127.0.0.1)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=freepdb1)))"
-	cfg.Credentials.Password = "token-value"
 
 	authenticator, err := GetAuthenticator(cfg, newTestProviderRegistry(
-		mockOCITokenAuthenticationProvider{
+		mockSignedTokenAuthenticationProvider{
 			mockTokenAuthenticationProvider: mockTokenAuthenticationProvider{token: "token-value"},
 		},
 	))
@@ -80,7 +86,6 @@ func TestGetAuthenticator_UsesTokenAuthenticatorForOAuth(t *testing.T) {
 
 	cfg := oracleconfig.NewOracleDriverConfig()
 	cfg.ConnectDescriptor = "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=127.0.0.1)(PORT=1521))(CONNECT_DATA=(SERVICE_NAME=freepdb1)))"
-	cfg.Credentials.Password = "token-value"
 
 	authenticator, err := GetAuthenticator(cfg, newTestProviderRegistry(
 		mockTokenAuthenticationProvider{token: "token-value"},
@@ -90,6 +95,38 @@ func TestGetAuthenticator_UsesTokenAuthenticatorForOAuth(t *testing.T) {
 	}
 	if _, ok := authenticator.(*tokenAuthenticator); !ok {
 		t.Fatalf("expected tokenAuthenticator, got %T", authenticator)
+	}
+}
+
+func TestGetAuthenticator_RejectsPasswordWithoutUsername(t *testing.T) {
+	t.Parallel()
+
+	cfg := oracleconfig.NewOracleDriverConfig()
+	cfg.Credentials.Password = "password"
+
+	authenticator, err := GetAuthenticator(cfg, newTestProviderRegistry(
+		mockTokenAuthenticationProvider{token: "token-value"},
+	))
+	if err == nil || !strings.Contains(err.Error(), "empty username") {
+		t.Fatalf("expected empty username error, got authenticator %T and error %v", authenticator, err)
+	}
+}
+
+func TestGetAuthenticator_PrefersPasswordCredentialsWhenUsernameIsPresent(t *testing.T) {
+	t.Parallel()
+
+	cfg := oracleconfig.NewOracleDriverConfig()
+	cfg.Credentials.User = "user"
+	cfg.Credentials.Password = "password"
+
+	authenticator, err := GetAuthenticator(cfg, newTestProviderRegistry(
+		mockTokenAuthenticationProvider{token: "token-value"},
+	))
+	if err != nil {
+		t.Fatalf("GetAuthenticator returned error: %v", err)
+	}
+	if _, ok := authenticator.(*PasswordAuthenticator); !ok {
+		t.Fatalf("expected PasswordAuthenticator, got %T", authenticator)
 	}
 }
 
@@ -149,7 +186,7 @@ func TestOAuthSetTokenKeyValsForOAUTHAddsTokenHeaderAndSignature(t *testing.T) {
 	}
 }
 
-func TestOCITokenProviderGenerateTokenHeader(t *testing.T) {
+func TestSignedTokenProviderGenerateTokenHeader(t *testing.T) {
 	t.Parallel()
 
 	sessContext := driverCommon.NewSessionContext()
@@ -158,7 +195,7 @@ func TestOCITokenProviderGenerateTokenHeader(t *testing.T) {
 	sessContext.UpdateSessionProperties(sessionProperties)
 
 	authenticator := &tokenAuthenticator{
-		tokenProvider:  mockOCITokenAuthenticationProvider{},
+		tokenProvider:  mockSignedTokenAuthenticationProvider{},
 		connectString:  "(DESCRIPTION=(ADDRESS=(PROTOCOL=TCPS)(HOST=adb.example.com)(PORT=1522))(CONNECT_DATA=(SERVICE_NAME=freepdb1)))",
 		sessionContext: sessContext,
 	}
@@ -213,7 +250,37 @@ func TestOAuthSetTokenKeyValsForOAUTHAddsTokenOnlyWithoutHeader(t *testing.T) {
 	}
 }
 
-func TestTokenAuthenticatorSignHeaderForOCIProvider(t *testing.T) {
+func TestResolveTokenCredentialsPassesTokenToSigningProvider(t *testing.T) {
+	t.Parallel()
+
+	privateKey := []byte("matching-key")
+	var tokenSeen string
+	authenticator := &tokenAuthenticator{
+		tokenProvider: mockSignedTokenAuthenticationProvider{
+			mockTokenAuthenticationProvider: mockTokenAuthenticationProvider{
+				token: "token-value",
+			},
+			privateKey: privateKey,
+			tokenSeen:  &tokenSeen,
+		},
+	}
+
+	token, gotPrivateKey, err := authenticator.resolveTokenCredentials(context.Background())
+	if err != nil {
+		t.Fatalf("resolveTokenCredentials returned error: %v", err)
+	}
+	if token != "token-value" {
+		t.Fatalf("token = %q, want token-value", token)
+	}
+	if tokenSeen != token {
+		t.Fatalf("PrivateKeyForToken token = %q, want %q", tokenSeen, token)
+	}
+	if string(gotPrivateKey) != string(privateKey) {
+		t.Fatalf("private key = %q, want %q", gotPrivateKey, privateKey)
+	}
+}
+
+func TestTokenAuthenticatorSignHeaderForSignedProvider(t *testing.T) {
 	t.Parallel()
 
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
@@ -221,13 +288,14 @@ func TestTokenAuthenticatorSignHeaderForOCIProvider(t *testing.T) {
 		t.Fatalf("GenerateKey failed: %v", err)
 	}
 
+	keyPEM := encodePrivateKeyPEM(t, privateKey)
 	authenticator := &tokenAuthenticator{
-		tokenProvider: mockOCITokenAuthenticationProvider{
-			privateKey: encodePrivateKeyPEM(t, privateKey),
+		tokenProvider: mockSignedTokenAuthenticationProvider{
+			privateKey: keyPEM,
 		},
 	}
 
-	got, err := authenticator.signHeader(context.Background(), "date: Mon, 10 Aug 2026 10:00:00 GMT")
+	got, err := authenticator.signHeader("date: Mon, 10 Aug 2026 10:00:00 GMT", keyPEM)
 	if err != nil {
 		t.Fatalf("signHeader returned error: %v", err)
 	}
@@ -246,7 +314,7 @@ func TestTokenAuthenticatorSignHeaderForOAuthProviderReturnsEmpty(t *testing.T) 
 		tokenProvider: mockTokenAuthenticationProvider{token: "token-value"},
 	}
 
-	got, err := authenticator.signHeader(context.Background(), "date: Mon, 10 Aug 2026 10:00:00 GMT")
+	got, err := authenticator.signHeader("date: Mon, 10 Aug 2026 10:00:00 GMT", nil)
 	if err != nil {
 		t.Fatalf("signHeader returned error: %v", err)
 	}

@@ -15,7 +15,7 @@ type ProviderRegistrar interface {
 // providers.
 type Provider interface{}
 
-/*** TOKEN AUTHENTICATI%ON ***/
+/*** TOKEN AUTHENTICATION ***/
 
 // TokenAuthenticationProvider returns the token used for token-based database
 // authentication flows.
@@ -25,13 +25,14 @@ type TokenAuthenticationProvider interface {
 	Token(context.Context) (string, error)
 }
 
-// OCITokenAuthenticationProvider extends TokenAuthenticationProvider with the
-// private key material required for OCI IAM token signing.
-type OCITokenAuthenticationProvider interface {
+// SignedTokenAuthenticationProvider extends TokenAuthenticationProvider with
+// the private key material required for signed token authentication.
+type SignedTokenAuthenticationProvider interface {
 	TokenAuthenticationProvider
-	// PrivateKey returns the PEM-encoded private key bytes used to sign OCI token
-	// headers and any retrieval error.
-	PrivateKey(context.Context) ([]byte, error)
+	// PrivateKeyForToken returns the PEM-encoded private key associated with
+	// token. Implementations must keep the association valid for every token
+	// they return until that token expires.
+	PrivateKeyForToken(context.Context, string) ([]byte, error)
 }
 
-/*** END OF TOKEN AUTHENTICATI%ON ***/
+/*** END OF TOKEN AUTHENTICATION ***/
