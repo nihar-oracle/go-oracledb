@@ -239,6 +239,21 @@ func TestClobExecutor_Write(t *testing.T) {
 	}
 }
 
+// TestClobExecutor_CLOBAndNCLOBAmountsUseUCS2Units verifies Oracle CLOB and NCLOB
+// operations count supplementary characters as two UCS-2 units.
+func TestClobExecutor_CLOBAndNCLOBAmountsUseUCS2Units(t *testing.T) {
+	t.Parallel()
+
+	const want = 3 // A (one UCS-2 unit) + 🙂 (surrogate pair)
+	got := lobCharacterUnits([]rune("A🙂"))
+	if got != want {
+		t.Fatalf("lobCharacterUnits(A🙂) = %d, want %d UCS-2 units", got, want)
+	}
+	if got == len([]rune("A🙂")) {
+		t.Fatalf("lobCharacterUnits used rune/code-point count %d instead of UCS-2 units", got)
+	}
+}
+
 const (
 	clobReadOffset   driverCommon.UB8 = 6
 	clobReadNumChars driverCommon.UB8 = 32523
@@ -257,26 +272,41 @@ func TestClobExecutor_Read(t *testing.T) {
 	wantMarshal, shelf, dbuf, marshalWritePosition := setUpReadScenario(t, clobReadMarshalGoldenPayload, clobReadResponseGoldenPayload, 131072)
 
 	lobExec := newClobExecutor(shelf, newTestSessionContext())
-	totalRuneCapacity := int(clobReadNumChars)
-	charOutBuffer := make([]rune, totalRuneCapacity)
-
-	readAmt, err := lobExec.read(ctx, newLocator(clobReadLocator, clobReadOffset), clobReadNumChars, clobReadIsNCLOB, charOutBuffer)
+	payload, logical, err := lobExec.read(ctx, newLocator(clobReadLocator, clobReadOffset), clobReadNumChars, clobReadIsNCLOB)
 	if err != nil {
 		t.Fatalf("Read failed: %v", err)
 	}
-	if readAmt == 0 {
+	if logical == 0 {
 		t.Fatalf("expected read to return a positive amount")
 	}
-	decoded := string(charOutBuffer[:int(readAmt)])
+	decoded := string(payload)
 	expected := strings.Repeat("This is a large text example. ", 20)[5:]
 	if decoded != expected {
 		t.Fatalf("decoded payload mismatch:\n got: %q\nwant: %q", decoded, expected)
+	}
+	if wantLogical := driverCommon.UB8(lobCharacterUnits([]rune(expected))); logical != wantLogical {
+		t.Fatalf("logical units = %d, want %d", logical, wantLogical)
 	}
 
 	gotMarshal := dbuf.bytes[marshalWritePosition:dbuf.currentWritePosition]
 	if !bytes.Equal(gotMarshal, wantMarshal) {
 		t.Fatalf("marshal payload mismatch:\n got: % X\nwant: % X", gotMarshal, wantMarshal)
 	}
+}
+
+// TestClobExecutor_DecodeReadPayloadRejectsIncompleteCharacter verifies
+// incomplete CLOB characters are rejected instead of decoded as U+FFFD.
+func TestClobExecutor_DecodeReadPayloadRejectsIncompleteCharacter(t *testing.T) {
+	t.Parallel()
+
+	executor := newClobExecutor(newShelf[driverCommon.MessageType]().Shelf, newTestSessionContext())
+	loc := newLocator(make(driverCommon.B1Array, koll4FlagOffset+1), 1)
+
+	_, _, err := executor.decodeReadPayload(loc, false, []byte{0xF0, 0x9F, 0x99})
+	requireErrorCode(t, err, oracleErrors.InvalidLOBBuffer)
+
+	_, _, err = executor.decodeReadPayload(loc, true, []byte{0xD8, 0x3D})
+	requireErrorCode(t, err, oracleErrors.InvalidLOBBuffer)
 }
 
 // setUpReadScenario provisions the shared TTC shelves and buffers necessary to
@@ -461,15 +491,13 @@ func TestClobExecutor_ReadErrors(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			exec, locator, offset, numChars, isNCLOB, charBuf, _ := tc.setup()
-			_, err := exec.read(ctx, newLocator(locator, offset), numChars, isNCLOB, charBuf)
+			exec, locator, offset, numChars, isNCLOB, _, _ := tc.setup()
+			_, _, err := exec.read(ctx, newLocator(locator, offset), numChars, isNCLOB)
 			if err == nil {
 				t.Fatalf("expected error")
 			}
 			if tc.expectErrCode != "" {
-				if code := getErrorCode(err); code != tc.expectErrCode {
-					t.Fatalf("unexpected error code: got %q want %q", code, tc.expectErrCode)
-				}
+				requireErrorCode(t, err, oracleErrors.ErrorCode(tc.expectErrCode))
 			}
 			if tc.expectErrContains != "" && !strings.Contains(err.Error(), tc.expectErrContains) {
 				t.Fatalf("unexpected error: %v", err)
@@ -531,9 +559,7 @@ func TestClobExecutor_WriteErrors(t *testing.T) {
 				t.Fatalf("expected error")
 			}
 			if tc.expectErrCode != "" {
-				if code := getErrorCode(err); code != tc.expectErrCode {
-					t.Fatalf("unexpected error code: got %q want %q", code, tc.expectErrCode)
-				}
+				requireErrorCode(t, err, oracleErrors.ErrorCode(tc.expectErrCode))
 			}
 			if tc.expectErrContains != "" && !strings.Contains(err.Error(), tc.expectErrContains) {
 				t.Fatalf("unexpected error: %v", err)
@@ -571,9 +597,7 @@ func TestClobExecutor_CreateTemporaryLobErrors(t *testing.T) {
 				t.Fatalf("expected error")
 			}
 			if tc.expectErrCode != "" {
-				if code := getErrorCode(err); code != tc.expectErrCode {
-					t.Fatalf("unexpected error code: got %q want %q", code, tc.expectErrCode)
-				}
+				requireErrorCode(t, err, oracleErrors.ErrorCode(tc.expectErrCode))
 			}
 			if tc.expectErrContains != "" && !strings.Contains(err.Error(), tc.expectErrContains) {
 				t.Fatalf("unexpected error: %v", err)
@@ -609,9 +633,7 @@ func TestClobExecutor_GetLengthErrors(t *testing.T) {
 				t.Fatalf("expected error")
 			}
 			if tc.expectErrCode != "" {
-				if code := getErrorCode(err); code != tc.expectErrCode {
-					t.Fatalf("unexpected error code: got %q want %q", code, tc.expectErrCode)
-				}
+				requireErrorCode(t, err, oracleErrors.ErrorCode(tc.expectErrCode))
 			}
 			if tc.expectErrContains != "" && !strings.Contains(err.Error(), tc.expectErrContains) {
 				t.Fatalf("unexpected error: %v", err)
@@ -648,9 +670,7 @@ func TestClobExecutor_IsOpenErrors(t *testing.T) {
 				t.Fatalf("expected error")
 			}
 			if tc.expectErrCode != "" {
-				if code := getErrorCode(err); code != tc.expectErrCode {
-					t.Fatalf("unexpected error code: got %q want %q", code, tc.expectErrCode)
-				}
+				requireErrorCode(t, err, oracleErrors.ErrorCode(tc.expectErrCode))
 			}
 			if tc.expectErrContains != "" && !strings.Contains(err.Error(), tc.expectErrContains) {
 				t.Fatalf("unexpected error: %v", err)
@@ -709,9 +729,7 @@ func TestClobExecutor_TrimErrors(t *testing.T) {
 				t.Fatalf("expected error")
 			}
 			if tc.expectErrCode != "" {
-				if code := getErrorCode(err); code != tc.expectErrCode {
-					t.Fatalf("unexpected error code: got %q want %q", code, tc.expectErrCode)
-				}
+				requireErrorCode(t, err, oracleErrors.ErrorCode(tc.expectErrCode))
 			}
 			if tc.expectErrContains != "" && !strings.Contains(err.Error(), tc.expectErrContains) {
 				t.Fatalf("unexpected error: %v", err)
@@ -747,9 +765,7 @@ func TestClobExecutor_GetChunkSizeErrors(t *testing.T) {
 				t.Fatalf("expected error")
 			}
 			if tc.expectErrCode != "" {
-				if code := getErrorCode(err); code != tc.expectErrCode {
-					t.Fatalf("unexpected error code: got %q want %q", code, tc.expectErrCode)
-				}
+				requireErrorCode(t, err, oracleErrors.ErrorCode(tc.expectErrCode))
 			}
 			if tc.expectErrContains != "" && !strings.Contains(err.Error(), tc.expectErrContains) {
 				t.Fatalf("unexpected error: %v", err)
@@ -890,27 +906,13 @@ func TestLobExecutor_ConsumeLobResponses_PullError(t *testing.T) {
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("expected Pull error %v, got %v", wantErr, err)
 	}
-	if code := getErrorCode(err); code != string(oracleErrors.LobExecError) {
-		t.Fatalf("unexpected error code: got %q want %q", code, oracleErrors.LobExecError)
-	}
+	requireErrorCode(t, err, oracleErrors.LobExecError)
 	if len(st.stub.events) != 0 {
 		t.Fatalf("LOB response handling left %d stale message(s)", len(st.stub.events))
 	}
 }
 
 // -------------------------------------------- Helpers for test ---------------------------------------------------------
-
-// getErrorCode extracts the SQLError code from the provided error, returning an
-// empty string for non-driver errors.
-func getErrorCode(err error) string {
-	if err == nil {
-		return ""
-	}
-	if sqlErr, ok := err.(oracleErrors.SQLError); ok {
-		return sqlErr.ErrorCode()
-	}
-	return ""
-}
 
 // newClobExecutorWithStub constructs a CLOB executor backed by a fake
 // streamer, allowing unit tests to simulate TTC failures deterministically.
@@ -977,6 +979,7 @@ func newTestLocator(variableWidth bool) driverCommon.B1Array {
 
 type fakeStreamer struct {
 	pushErr   error
+	pushed    []driverCommon.Message[driverCommon.MessageType]
 	flushErr  error
 	pullErr   error
 	events    []driverCommon.Message[driverCommon.MessageType]
@@ -988,8 +991,12 @@ type fakeStreamer struct {
 	locator   driverCommon.B1Array
 }
 
-func (s *fakeStreamer) Push(context.Context, driverCommon.Message[driverCommon.MessageType]) error {
-	return s.pushErr
+func (s *fakeStreamer) Push(_ context.Context, msg driverCommon.Message[driverCommon.MessageType]) error {
+	if s.pushErr != nil {
+		return s.pushErr
+	}
+	s.pushed = append(s.pushed, msg)
+	return nil
 }
 
 func (s *fakeStreamer) Pull(ctx context.Context, expected ...driverCommon.MessageType) (driverCommon.Message[driverCommon.MessageType], error) {

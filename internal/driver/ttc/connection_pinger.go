@@ -54,6 +54,15 @@ import (
 //
 //	otherwise nil
 func (c *connection) Ping(ctx context.Context) error {
+	closed, valid := c.connectionState()
+	if closed || !valid {
+		return driver.ErrBadConn
+	}
+	unlock, guardErr := c.shelf.synchronizer.begin(ctx)
+	if guardErr != nil {
+		return driver.ErrBadConn
+	}
+	defer unlock()
 	err := c.runFunctionWithFunHeader(ctx, ping)
 	if err != nil {
 		return driver.ErrBadConn
@@ -72,9 +81,14 @@ const (
 //
 // Returns: true if the connection is valid otherwise false
 func (c *connection) IsValid() bool {
-
+	closed, valid := c.connectionState()
+	if closed || !valid {
+		return false
+	}
 	// Check if inband notification has been received.
-	c._isValid = c._isValid && !c.ns.CheckInbandNotification()
-
-	return c._isValid
+	if c.ns.CheckInbandNotification() {
+		c.invalidate()
+	}
+	closed, valid = c.connectionState()
+	return !closed && valid
 }

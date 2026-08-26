@@ -115,6 +115,7 @@ type MessageStreamer struct {
 	outgoingMessages *list.List
 	// Add a shelf field to hold context.
 	shelf          *ttiShelf[driverCommon.MessageType]
+	tempLobBatches map[*tTIlob]*tempLobFreeBatch
 	postUCallbacks map[driverCommon.MessageType]StreamerPostUnmarshallCallback
 	preUCallbacks  map[driverCommon.MessageType]StreamerPreUnmarshallCallback
 }
@@ -135,6 +136,7 @@ func NewMessageStreamer(shelf *ttiShelf[driverCommon.MessageType]) *MessageStrea
 		preUCallbacks:    make(map[driverCommon.MessageType]StreamerPreUnmarshallCallback),
 		postUCallbacks:   make(map[driverCommon.MessageType]StreamerPostUnmarshallCallback),
 		shelf:            shelf,
+		tempLobBatches:   make(map[*tTIlob]*tempLobFreeBatch),
 	}
 }
 
@@ -153,6 +155,36 @@ func (ms *MessageStreamer) Push(ctx context.Context, msg driverCommon.Message[dr
 		if err != nil {
 			common.Odl.Warn("MessageStreamer: oemergency flush failed, drain it", "error", err)
 			ms.Drain(common.BackgroundContext, driverCommon.OUT)
+		}
+	}
+
+	// Temporary-LOB cleanup is carried immediately before the next
+	// ordinary TTC function. LOGOFF is the exception: physical session teardown
+	// releases all session-duration LOBs, so queued local state is discarded.
+	// This runs after the emergency overflow flush so TTIPFN is never separated
+	// from the ordinary function that gives it its piggyback transport.
+	if msg.GetMsgCode() == TTIFUN {
+		if function, ok := msg.(driverCommon.Function); ok && function.GetFuncCode() == logOff {
+			newLobManager(ms.shelf, nil).discardSessionState()
+		} else {
+			batch, err := ms.shelf.lobState.temporary.reservePending()
+			if err != nil {
+				return err
+			}
+			if batch != nil {
+				definition := &lobDefinition{
+					sourceLocator: newLocator(batch.locators, 0),
+					sendLobAmt:    false,
+					operation:     kplobArrayTmpFree,
+				}
+				piggyback := newTTIlobPiggyback().(*tTIlob)
+				if err := piggyback.SetDefinition(definition); err != nil {
+					ms.shelf.lobState.temporary.restorePending(batch)
+					return err
+				}
+				ms.tempLobBatches[piggyback] = batch
+				ms.outgoingMessages.PushBack(piggyback)
+			}
 		}
 	}
 	ms.outgoingMessages.PushBack(msg)
@@ -339,12 +371,14 @@ func (ms *MessageStreamer) Flush(ctx context.Context) error {
 		err = header.MarshalTo(ctx, ms.shelf.GetMarshaller())
 		if err != nil {
 			common.Odl.Warn("Failed to flush, can't marshall message code", "error", err)
+			ms.restoreTemporaryLobBatches()
 			return common.NewOracleError(oracleErrors.StreamerWriteError, err, nil)
 		}
 
 		err = marshalable.MarshalTo(ctx, ms.shelf.GetMarshaller())
 		if err != nil {
 			common.Odl.Warn("Failed to flush, can't mashall message", "error", err)
+			ms.restoreTemporaryLobBatches()
 			return common.NewOracleError(oracleErrors.StreamerWriteError, err, nil)
 		}
 		ms.outgoingMessages.Remove(outgoing)
@@ -353,9 +387,28 @@ func (ms *MessageStreamer) Flush(ctx context.Context) error {
 	err = ms.shelf.GetMarshaller().Flush(ctx)
 	if err != nil {
 		common.Odl.Warn("Failed to flush, can't flush underlying layer", "error", err)
+		// The transport may have committed some or all of the piggyback. Retrying
+		// it could free an already-freed LOB, so abandon session-local state and
+		// invalidate the physical connection.
+		newLobManager(ms.shelf, nil).discardSessionState()
+		clear(ms.tempLobBatches)
+		ms.shelf.getEventService().post(streamerStaleEvent)
 		return common.NewOracleError(oracleErrors.StreamerWriteError, err, nil)
 	}
+	for piggyback, batch := range ms.tempLobBatches {
+		ms.shelf.lobState.temporary.completePending(batch)
+		delete(ms.tempLobBatches, piggyback)
+	}
 	return err
+}
+
+// restoreTemporaryLobBatches returns batches to the pending registry after a
+// marshalling failure that occurred before the transport flush was attempted.
+func (ms *MessageStreamer) restoreTemporaryLobBatches() {
+	for piggyback, batch := range ms.tempLobBatches {
+		ms.shelf.lobState.temporary.restorePending(batch)
+		delete(ms.tempLobBatches, piggyback)
+	}
 }
 
 // Drain implementation. See Streamer interface
@@ -372,6 +425,9 @@ func (ms *MessageStreamer) Drain(ctx context.Context, direction driverCommon.Str
 		ms.incomingMessages.Init()
 	}
 	if direction == driverCommon.OUT || direction == driverCommon.INOUT {
+		// Batches still tracked here have not reached Marshaller.Flush; transport
+		// errors discard the map before Drain can run.
+		ms.restoreTemporaryLobBatches()
 		oRes = ms.outgoingMessages.Len()
 		ms.outgoingMessages.Init()
 	}

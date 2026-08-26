@@ -47,6 +47,7 @@ import (
 
 	"github.com/oracle/go-oracledb/v26/internal/common"
 	drvierCommon "github.com/oracle/go-oracledb/v26/internal/driver/common"
+	internallob "github.com/oracle/go-oracledb/v26/internal/lob"
 	oracleErrors "github.com/oracle/go-oracledb/v26/oracle/errors"
 	"golang.org/x/text/language"
 )
@@ -67,6 +68,73 @@ type queryContextFunc func(context.Context, *qualifiedSQLStatement, []driver.Nam
 // QueryContext calls the wrapped function literal.
 func (f queryContextFunc) QueryContext(ctx context.Context, query *qualifiedSQLStatement, args []driver.NamedValue) (driver.Rows, error) {
 	return f(ctx, query, args)
+}
+
+type nonTTCRows struct{ closed bool }
+
+func (*nonTTCRows) Columns() []string         { return nil }
+func (*nonTTCRows) Next([]driver.Value) error { return nil }
+func (rows *nonTTCRows) Close() error         { rows.closed = true; return nil }
+
+func TestStatement_QueryContextRejectsUnexpectedRowsType(t *testing.T) {
+	t.Parallel()
+	shelf := newShelf[drvierCommon.MessageType]()
+	shelf.RegisterMessageStreamer(&mockStreamer{})
+	unexpected := &nonTTCRows{}
+	stmt := &Statement{shelf: shelf, qualifiedQuery: &qualifiedSQLStatement{}, queryStatementExecutor: queryContextFunc(func(context.Context, *qualifiedSQLStatement, []driver.NamedValue) (driver.Rows, error) {
+		return unexpected, nil
+	})}
+	rows, err := stmt.QueryContext(context.Background(), nil)
+	if err == nil {
+		t.Fatal("QueryContext unexpectedly accepted a non-ttcRows result")
+	}
+	if rows != nil {
+		t.Fatalf("Rows = %T, want nil on executor contract violation", rows)
+	}
+	if !unexpected.closed {
+		t.Fatal("unexpected Rows implementation was not closed")
+	}
+	requireErrorCode(t, err, oracleErrors.InternalError)
+}
+
+func TestStatement_CloseFlushesCursorClose(t *testing.T) {
+	t.Parallel()
+	shelf := newShelf[drvierCommon.MessageType]()
+	streamer := &mockStreamer{}
+	shelf.RegisterMessageStreamer(streamer)
+	shelf.RegisterMessageFactory(&mockFactory{returnMsg: &tTIOcca{}})
+	stmt := &Statement{shelf: shelf, qualifiedQuery: &qualifiedSQLStatement{cursorId: 7}}
+	shelf.AddStatement(stmt)
+	if err := stmt.Close(); err != nil {
+		t.Fatalf("Statement.Close returned error: %v", err)
+	}
+	if !streamer.pushCalled || !streamer.flushCalled {
+		t.Fatalf("cursor close calls = push:%t flush:%t, want both true", streamer.pushCalled, streamer.flushCalled)
+	}
+	if stmt.qualifiedQuery.cursorId != 0 {
+		t.Fatalf("cursor ID = %d, want cleared after successful flush", stmt.qualifiedQuery.cursorId)
+	}
+}
+
+func TestStatement_ValidatesBindShapeBeforeConsumingLobSource(t *testing.T) {
+	t.Parallel()
+
+	query, err := newQualifiedSQLStatement("insert into t values (:1)")
+	if err != nil {
+		t.Fatalf("newQualifiedSQLStatement returned error: %v", err)
+	}
+	source := &failIfReadReader{}
+	stmt := &Statement{shelf: newShelf[drvierCommon.MessageType](), qualifiedQuery: query}
+	_, err = stmt.execContext(context.Background(), []driver.NamedValue{
+		{Ordinal: 1, Value: internallob.NewInput(source, internallob.BLOB, 1)},
+		{Ordinal: 2, Value: int64(2)},
+	})
+	if err == nil {
+		t.Fatal("execContext accepted an extra SQL bind")
+	}
+	if source.read {
+		t.Fatal("LOB source was consumed before SQL bind validation")
+	}
 }
 
 // Tests cancelCurrentExecution
@@ -219,6 +287,33 @@ func TestStatementHandleContextCancelledRunsBreakReset(t *testing.T) {
 	}
 }
 
+// TestStatement_HandleContextCancelledInvalidatesOnRestoreFailure verifies a
+// connection is not reused when break/reset cannot consume its terminal TTIOER.
+func TestStatement_HandleContextCancelledInvalidatesOnRestoreFailure(t *testing.T) {
+	t.Parallel()
+	restoreErr := errors.New("terminal response unavailable")
+	mockStr := &mockStreamer{pullErr: restoreErr}
+	shelf := newShelf[drvierCommon.MessageType]()
+	shelf.RegisterMessageStreamer(mockStr)
+	shelf.registerCancelExecution(func(context.Context) error { return nil })
+	recorder := &lobEventRecorder{}
+	shelf.getEventService().register(recorder, streamerStaleEvent)
+
+	stmt := &Statement{shelf: shelf}
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	subCtx, _, cleanup := stmt.createSubContextWithCancelAfterfunction(parentCtx)
+	defer cleanup()
+
+	cancelParent()
+	_, err := (&statementProcessor{shelf: shelf}).handleContextCancelled(subCtx)
+	if !errors.Is(err, restoreErr) {
+		t.Fatalf("handleContextCancelled error = %v, want %v", err, restoreErr)
+	}
+	if len(recorder.events) != 1 || recorder.events[0] != streamerStaleEvent {
+		t.Fatalf("events = %v, want [streamerStaleEvent]", recorder.events)
+	}
+}
+
 // TestStatementExecContextTransactionCancellationBeforeSetup verifies a
 // transaction cancellation cannot race an uninitialized statement cancel func.
 func TestStatementExecContextTransactionCancellationBeforeSetup(t *testing.T) {
@@ -227,8 +322,11 @@ func TestStatementExecContextTransactionCancellationBeforeSetup(t *testing.T) {
 	shelf.RegisterMessageStreamer(&mockStreamer{})
 	txCtx, cancelTx := context.WithCancel(context.Background())
 	cancelTx()
-	shelf.registerTransaction(newTransaction(&connection{shelf: shelf}, txCtx))
-	defer shelf.unregisterTransaction()
+	transaction := newTransaction(&connection{shelf: shelf}, txCtx)
+	if !shelf.registerTransaction(transaction) {
+		t.Fatal("registerTransaction returned false")
+	}
+	defer shelf.unregisterTransaction(transaction)
 
 	query, err := newQualifiedSQLStatement("insert into t values(1)")
 	if err != nil {

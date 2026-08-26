@@ -41,6 +41,8 @@ package ttc
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
+	"sync"
 	"testing"
 
 	"github.com/oracle/go-oracledb/v26/internal/common"
@@ -49,8 +51,86 @@ import (
 	"golang.org/x/text/language"
 )
 
-// 1. Create a new shelf and check that it is not nil
-// 2. Ensure maps are nil by default (until registered)
+// TestTTIShelf_SessionSynchronizerSerializesAccess verifies shelf copies share one
+// physical-session operation lock.
+func TestTTIShelf_SessionSynchronizerSerializesAccess(t *testing.T) {
+	t.Parallel()
+	shelf := newShelf[driverCommon.MessageType]()
+	shelfCopy := *shelf
+	unlock, err := shelf.synchronizer.begin(context.Background())
+	if err != nil {
+		t.Fatalf("beginOperation returned error: %v", err)
+	}
+	if copiedUnlock, ok := shelfCopy.synchronizer.tryBegin(); ok {
+		copiedUnlock()
+		unlock()
+		t.Fatal("operation guard copy did not share the physical-session lock")
+	}
+	unlock()
+	reacquired, ok := shelf.synchronizer.tryBegin()
+	if !ok {
+		t.Fatal("operation guard was not released")
+	}
+	reacquired()
+}
+
+// TestTTIShelf_SessionSynchronizerAcquisitionHonorsContext verifies a blocked lock
+// acquisition respects context cancellation.
+func TestTTIShelf_SessionSynchronizerAcquisitionHonorsContext(t *testing.T) {
+	t.Parallel()
+	shelf := newShelf[driverCommon.MessageType]()
+	release, err := shelf.synchronizer.begin(context.Background())
+	if err != nil {
+		t.Fatalf("first acquisition returned error: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	waiting := make(chan struct{})
+	shelf.synchronizer.testOnWait = func() { close(waiting) }
+	result := make(chan error, 1)
+	go func() {
+		blockedRelease, err := shelf.synchronizer.begin(ctx)
+		if blockedRelease != nil {
+			blockedRelease()
+		}
+		result <- err
+	}()
+	<-waiting
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		release()
+		t.Fatalf("blocked acquisition error = %v, want context.Canceled", err)
+	}
+	release()
+}
+
+// TestTTIShelf_ConcurrentStatementRegistry verifies concurrent statement
+// registry access is synchronized.
+func TestTTIShelf_ConcurrentStatementRegistry(t *testing.T) {
+	t.Parallel()
+
+	shelf := newShelf[driverCommon.MessageType]()
+	statements := make([]*Statement, 32)
+	for index := range statements {
+		statements[index] = &Statement{}
+	}
+	var wait sync.WaitGroup
+	for index := 0; index < 8; index++ {
+		wait.Add(1)
+		go func(worker int) {
+			defer wait.Done()
+			for iteration := 0; iteration < 100; iteration++ {
+				statement := statements[(worker+iteration)%len(statements)]
+				shelf.AddStatement(statement)
+				_ = shelf.GetStatements(false)
+				shelf.RemoveStatement(statement)
+			}
+		}(index)
+	}
+	wait.Wait()
+}
+
+// TestTTIShelf_NewShelf verifies a new shelf initializes required services.
 func TestTTIShelf_NewShelf(t *testing.T) {
 	t.Parallel()
 	shelf := newShelf[int]()
@@ -75,8 +155,8 @@ func TestTTIShelf_NewShelf(t *testing.T) {
 	}
 }
 
-// 1. Register codec factory and verify GetCodecFactory returns it
-// 2. Re-register factory and verify it is replaced
+// TestTTIShelf_RegisterCodecFactoryAndGetter verifies codec factory
+// registration and replacement.
 func TestTTIShelf_RegisterCodecFactoryAndGetter(t *testing.T) {
 	t.Parallel()
 	shelf := newShelf[int]()
@@ -170,7 +250,8 @@ func (t *testCodecFactory) getDefineOac(_ DtyType, _ columnContext, _ driverComm
 // TestTTIShelf_StatementDrain test GetStatements API
 // expectations:
 //   - it returns all statements previously added
-//   - second call return an empty slice
+//   - a draining call returns the statements and clears the registry
+//   - the following retrieval returns an empty slice
 func TestTTIShelf_StatementDrain(t *testing.T) {
 	t.Parallel()
 	shelf := newShelf[driverCommon.MessageType]()
@@ -211,5 +292,8 @@ func TestTTIShelf_StatementDrain(t *testing.T) {
 	emptyOnes := shelf.GetStatements(true)
 	if len(emptyOnes) == 0 {
 		t.Fatalf("statements in the shelf should not have been drained")
+	}
+	if remaining := shelf.GetStatements(false); len(remaining) != 0 {
+		t.Fatalf("statements after drain = %d, want 0", len(remaining))
 	}
 }

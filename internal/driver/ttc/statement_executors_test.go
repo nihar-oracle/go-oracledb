@@ -39,6 +39,7 @@
 package ttc
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	sqldriver "database/sql/driver"
@@ -47,8 +48,16 @@ import (
 	"testing"
 
 	"github.com/oracle/go-oracledb/v26/internal/driver/common"
+	internallob "github.com/oracle/go-oracledb/v26/internal/lob"
 	oracleErrors "github.com/oracle/go-oracledb/v26/oracle/errors"
 )
+
+func TestStatementProcessor_RejectsUnpreparedStreamedLobInput(t *testing.T) {
+	t.Parallel()
+	processor := statementProcessor{shelf: newShelf[common.MessageType]()}
+	err := processor.prepareBindsAndOAC([]sqldriver.Value{internallob.NewInput(bytes.NewReader([]byte("payload")), internallob.BLOB, int64(len("payload")))})
+	requireErrorCode(t, err, oracleErrors.InvalidLobInput)
+}
 
 // Oall8Payload extracts TTC OALL8 payload (post header) from dump, same convention as ttioall_test.go
 func Oall8Payload(lines []string) []byte {

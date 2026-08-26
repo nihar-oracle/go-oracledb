@@ -48,6 +48,7 @@ import (
 
 	"github.com/oracle/go-oracledb/v26/internal/common"
 	driverCommon "github.com/oracle/go-oracledb/v26/internal/driver/common"
+	internallob "github.com/oracle/go-oracledb/v26/internal/lob"
 	oracleErrors "github.com/oracle/go-oracledb/v26/oracle/errors"
 )
 
@@ -71,9 +72,13 @@ Implementations:
     TTIRXD messages until completion.
 
 Contract:
-  - The returned Rows streams result data; callers must iterate to completion and
-    call Close to release resources.
-  - The passed query host the request cursor Id that would be updated after round-trips
+  - The returned Rows owns the result lifecycle; callers must iterate to
+    completion and call Close to release resources.
+  - The passed query holds the cursor ID updated after round trips.
+  - args contains only Oracle bind values; driver-only options were removed by
+    the Connection or Statement layer.
+  - options is a validated value snapshot for this execution and must not be
+    retained as mutable connection or reusable-statement state.
 
 Parameters:
 - ctx: request-scoped context for cancellation and timeouts.
@@ -85,11 +90,8 @@ Returns:
 - error on failure (e.g., factory/push/flush/pull issues or server-side errors).
 */
 type QueryWithContext interface {
-	// QueryContext defines the ability to execute a query with context and positional args.
-	// returns:
-	//   - the selected rows
-	//   - the cursorId ID, of this request
-	//   - error if request has failed
+	// QueryContext executes query with Oracle SQL binds and returns lifecycle-
+	// owning Rows or an error, never both on failure.
 	QueryContext(ctx context.Context, query *qualifiedSQLStatement, args []driver.NamedValue) (driver.Rows, error)
 }
 
@@ -132,7 +134,7 @@ type statementProcessor struct {
 	opts          driverCommon.UB4                    // OALL8 option bitmask (parse/execute/commit/no-PLSQL/binds-present flags etc).
 	al8i4         []driverCommon.UB4                  // AL8I4 options vector attached to OALL8 (iterations, select flag, extra protocol flags).
 	bindValues    []any                               // Original bind values (ordered by position) for the current execution.
-	encodedValues [][]driverCommon.B1Array            // Wire-encoded bind payloads per iteration (each inner slice is a TTIRXD bind row).
+	encodedValues [][]encodedBind                     // TTC-ready bind payloads per iteration.
 	currentOacs   []driverCommon.Marshallable         // Per-bind OAC descriptors (type/size metadata) sent alongside bind values.
 	previousOacs  []driverCommon.Marshallable         // Cached OACs from previous execution of the statement
 }
@@ -182,25 +184,36 @@ func (m selectResultMetadata) newRows(shelf *ttiShelf[driverCommon.MessageType])
 	return rows
 }
 
-// queryRunState contains state whose lifetime is one runQuery invocation. BVC
-// carry data, LOB metadata, and rows must never be reused by a later protocol
-// round trip.
+// queryRunState contains state whose lifetime is exactly one runQuery TTC
+// exchange. BVC carry data, row buffers, and LOB metadata must never leak into
+// a later execution of a reusable Statement.
 type queryRunState struct {
-	rowCount   driverCommon.UB4
+	// rowCount is assigned to newly decoded RXD messages in receive order.
+	rowCount driverCommon.UB4
+	// bvcColSent is the current bit vector describing columns present in the next
+	// BVC-compressed row.
 	bvcColSent *driverCommon.BitSet
-	bvcFound   bool
+	// bvcFound reports whether bvcColSent should be applied to the next RXD.
+	bvcFound bool
 	// prevRow and prevLobColContext form the aligned previous-row state used by
 	// BVC carry.
 	prevRow           []driverCommon.B1Array
 	prevLobColContext []*lobColumnContext
-	rows              *ttcRows
+	// rows accumulates decoded results.
+	rows *ttcRows
 }
 
 // newQueryRunState creates clean row and BVC state for one runQuery invocation.
 // When result metadata is already cached, it also creates a fresh rows object
 // so an OEXFEN response can be decoded without receiving another DCB message.
 func (e *statementExecutorSelect) newQueryRunState() *queryRunState {
-	return &queryRunState{rows: e.resultMetadata.newRows(e.shelf)}
+	state := &queryRunState{
+		rows: e.resultMetadata.newRows(e.shelf),
+	}
+	if state.rows != nil {
+		state.rows.SetSessionContext(e.sessCtx)
+	}
+	return state
 }
 
 // newStatementExecutorSelect constructs a SELECT executor with server-parse and execute flags,
@@ -348,8 +361,8 @@ func isNoDataFoundError(err error) bool {
 	return ok && sqlErr.ErrorCode() == string(oracleErrors.NoDataFound)
 }
 
-// QueryContext builds and submits an OALL8 request for SELECT statements and
-// runs the TTC pipeline to fetch rows.
+// QueryContext builds and submits the OALL8 parse/execute and optional
+// define/fetch exchanges for a SELECT. namedValues contains only SQL binds.
 func (e *statementExecutorSelect) QueryContext(ctx context.Context, query *qualifiedSQLStatement, namedValues []driver.NamedValue) (sqldriver.Rows, error) {
 	var err error
 	// validate the arguments against the parsed bind placeholders.
@@ -427,7 +440,7 @@ Parameters:
     false for the initial parse/execute request.
 
 Returns:
-  - common.UB4: OALL8 options appropriate for either parse/execute or define/fetch.
+  - driverCommon.UB4: OALL8 options appropriate for either parse/execute or define/fetch.
 */
 func (e *statementExecutorSelect) buildOAll8Options(isDefine bool) driverCommon.UB4 {
 	if isDefine {
@@ -516,7 +529,7 @@ Description:
     SQL text, and the AL8I4 options vector.
   - If bind arguments are supplied, it:
   - Normalizes sql/driver.NamedValue into a 0-based []any slice aligned to bind positions.
-  - Encodes bind values into wire format [][]common.B1Array (currently 1 iteration).
+  - Encodes bind values into wire format [][]driverCommon.B1Array (currently 1 iteration).
   - Builds per-bind OAC descriptors and sets bind-related fields and flags on the OALL8.
 
 Parameters:
@@ -608,7 +621,7 @@ Parameters:
 - flags: Bitmask of AL8I4 extra flags (stored in AL8I4[9]).
 
 Returns:
-- []common.UB4: Fully initialized AL8I4 vector.
+- []driverCommon.UB4: Fully initialized AL8I4 vector.
 */
 func buildAl8i4(iterations driverCommon.UB4, selectStmt bool, flags driverCommon.UB4, parseOption driverCommon.UB4) []driverCommon.UB4 {
 	common.Odl.Debug("buildAl8i4: called",
@@ -652,12 +665,24 @@ func (e *statementProcessor) prepareBindsAndOAC(args []sqldriver.Value) error {
 	e.bindValues = make([]any, n)
 	// TODO : currently, just do it for single row, later when
 	//        batching support is added, make it dynamic.
-	e.encodedValues = make([][]driverCommon.B1Array, 1)
+	e.encodedValues = make([][]encodedBind, 1)
 	currentRow := 0
-	e.encodedValues[currentRow] = make([]driverCommon.B1Array, n)
+	e.encodedValues[currentRow] = make([]encodedBind, n)
 	e.currentOacs = make([]driverCommon.Marshallable, n)
 	for i, v := range args {
 		e.bindValues[i] = v
+		if bind, isLobLocatorBind := v.(lobLocatorBind); isLobLocatorBind {
+			encoded, oac, err := encodeLobLocatorBind(bind)
+			if err != nil {
+				return err
+			}
+			e.encodedValues[currentRow][i] = encodedBind{data: encoded, lobLocator: true}
+			e.currentOacs[i] = oac
+			continue
+		}
+		if _, isLobInput := v.(internallob.Input); isLobInput {
+			return common.NewOracleError(oracleErrors.InvalidLobInput, nil, "bind preparation")
+		}
 		// sql.Out{}, int, float, string,time
 		var err error
 		normalized := normalizeBindValue(v)
@@ -666,14 +691,15 @@ func (e *statementProcessor) prepareBindsAndOAC(args []sqldriver.Value) error {
 			return err
 		}
 
-		e.encodedValues[currentRow][i], err = encoder(normalized.value)
-		if err != nil {
-			return err
+		encoded, encodeErr := encoder(normalized.value)
+		if encodeErr != nil {
+			return encodeErr
 		}
+		e.encodedValues[currentRow][i] = encodedBind{data: encoded}
 
 		e.currentOacs[i], err = e.shelf.GetCodecFactory().getBindOac(
 			normalized,
-			e.getMaxLengthForOac(i, len(e.encodedValues[currentRow][i])),
+			e.getMaxLengthForOac(i, len(e.encodedValues[currentRow][i].data)),
 		)
 		if err != nil {
 			return err
@@ -713,7 +739,7 @@ func (e *statementProcessor) pushBindRows(
 			return common.NewOracleError(errCode, gerr, "push")
 		}
 		rxd := msg.(*tTIrxd)
-		rxd.setBindValues(row)
+		rxd.setEncodedBinds(row)
 		if err := stmr.Push(ctx, rxd); err != nil {
 			common.Odl.Error(caller+": Push RXD failed", "error", err, "stage", "push", "msgCode", rxd.GetMsgCode())
 			return common.NewOracleError(errCode, err, "push")
@@ -760,7 +786,7 @@ Parameters:
   - currLength: byte length of the currently encoded value for that bind.
 
 Returns:
-  - common.UB4: the maximum of the previous OAC maxLength (if present) and the current value length.
+  - driverCommon.UB4: the maximum of the previous OAC maxLength (if present) and the current value length.
 */
 func (e *statementProcessor) getMaxLengthForOac(position int, currLength int) driverCommon.UB4 {
 	if e.previousOacs == nil || len(e.previousOacs) <= position {
@@ -1056,21 +1082,18 @@ func (e *statementExecutorExec) runExec(ctx context.Context, message driverCommo
 //
 //	returned by the server
 func (e *statementProcessor) handleContextCancelled(ctx context.Context) (driverCommon.Message[driverCommon.MessageType], error) {
-	cancellationState, ok := ctx.Value(statementCancellationContextKey{}).(*statementCancellationState)
-	if ok && cancellationState != nil {
-		common.Odl.Debug("Context error received using break-reset protocol, allow after function to start")
-		// allow after func to start break-reset
-		cancellationCtx, started := cancellationState.requestBreakReset()
-		if !started {
-			return nil, ctx.Err()
-		}
-		defer cancellationCtx.CancelFunc()
-		common.Odl.Debug("Break-reset completed, fetch OER")
-		// The context has been cancelled, cancel current execution and return
-		// error
-		return e.shelf.GetMessageStreamer().Pull(cancellationCtx.Context, TTIOER)
+	common.Odl.Debug("Context error received; restoring TTC synchronization with break/reset")
+	streamer, ok := e.shelf.GetMessageStreamer().(MessageStreamerInterface)
+	if !ok {
+		return nil, common.NewOracleError(oracleErrors.InternalError, nil)
 	}
-	return nil, ctx.Err()
+	message, err := e.shelf.cancellation.restore(ctx, streamer)
+	if err != nil {
+		// A successful break without its terminal TTIOER is still ambiguous: the
+		// next user must never inherit a partially drained TTC response.
+		e.shelf.getEventService().post(streamerStaleEvent)
+	}
+	return message, err
 }
 
 // handleDCB refreshes the SELECT statement's result metadata and creates a
@@ -1086,6 +1109,7 @@ func (e *statementExecutorSelect) handleDCB(state *queryRunState, msg driverComm
 	}
 	e.resultMetadata.replace(columns)
 	state.rows = e.resultMetadata.newRows(e.shelf)
+	state.rows.SetSessionContext(e.sessCtx)
 	return nil
 }
 
@@ -1157,7 +1181,7 @@ Parameters:
     provided to satisfy the pre-unmarshal callback signature.
 
 Returns:
-  - common.Message[common.MessageType]: the initialized *tTIrxd instance.
+  - driverCommon.Message[driverCommon.MessageType]: the initialized *tTIrxd instance.
   - error: non-nil if the message factory cannot allocate TTIRXD.
 */
 func (e *statementExecutorDML) createRXD(t *messageHeader) (driverCommon.Message[driverCommon.MessageType], error) {
@@ -1360,9 +1384,9 @@ func (s *queryRunState) handleRXDRow(msg driverCommon.Message[driverCommon.Messa
 		for i := range rxd.row {
 			currRow[i] = append(driverCommon.B1Array(nil), rxd.row[i]...)
 		}
-		// RXD messages are created per row and their LOB contexts are read-only
-		// after unmarshalling, so rows and BVC state can safely share this slice.
-		currLobColContext := rxd.getLobColumnContext()
+		// LOB values outlive the RXD decoder. Deep-copy both metadata and opaque
+		// locator bytes so later message reuse cannot mutate an escaped reader.
+		currLobColContext := cloneLobColumnContexts(rxd.getLobColumnContext())
 		s.rows.rowData = append(s.rows.rowData, currRow)
 		s.rows.lobColContext = append(s.rows.lobColContext, currLobColContext)
 		s.prevRow = currRow
@@ -1372,6 +1396,28 @@ func (s *queryRunState) handleRXDRow(msg driverCommon.Message[driverCommon.Messa
 	}
 	s.bvcColSent = nil
 	s.bvcFound = false
+}
+
+// cloneLobColumnContexts returns row-owned metadata and locator storage. Nil
+// entries remain nil so the result stays column-aligned for BVC carry.
+func cloneLobColumnContexts(source []*lobColumnContext) []*lobColumnContext {
+	if source == nil {
+		return nil
+	}
+	cloned := make([]*lobColumnContext, len(source))
+	for index, metadata := range source {
+		if metadata == nil {
+			continue
+		}
+		copyOfMetadata := *metadata
+		copyOfMetadata.lobLocator = append(driverCommon.B1Array(nil), metadata.lobLocator...)
+		if len(copyOfMetadata.lobLocator) != 0 {
+			loc := newLocator(copyOfMetadata.lobLocator, 1)
+			copyOfMetadata.temporary = metadata.temporary || loc.isTemporaryLocator() || loc.isAbstractLocator()
+		}
+		cloned[index] = &copyOfMetadata
+	}
+	return cloned
 }
 
 // registerRunQueryCallbacks sets up all required pre-unmarshal callbacks for a query context.

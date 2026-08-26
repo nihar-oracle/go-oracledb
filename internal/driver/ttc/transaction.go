@@ -46,9 +46,15 @@ import (
 	oracleErrors "github.com/oracle/go-oracledb/v26/oracle/errors"
 )
 
+// transaction implements driver.Tx for one transaction registered on a
+// physical Connection. Commit and Rollback serialize their entire TTC exchange
+// through the connection-wide operation guard; their context is also observed
+// by statement cancellation and, later, locator-backed LOB operations.
 type transaction struct {
+	// _underlyingConnection owns the physical session and transaction registry.
 	_underlyingConnection *connection
-	// the current transaction context
+	// _transactionContext controls statement and future LOB cancellation for the
+	// lifetime of this transaction.
 	_transactionContext context.Context
 }
 
@@ -70,14 +76,25 @@ func (t *transaction) getTransactionContext() context.Context {
 	return t._transactionContext
 }
 
-// Commit commits the transaction
+// Commit implements driver.Tx.Commit. It commits the registered transaction,
+// drains the complete TTC response, and unregisters it only after success.
 func (t *transaction) Commit() error {
-	common.Odl.Debug("Transaction commit")
-	if !t._underlyingConnection.shelf.isInTransaction() {
+	if !t._underlyingConnection.shelf.isCurrentTransaction(t) {
 		return t._underlyingConnection.shelf.LocalizeError(newNotInTransactionError())
 	}
-
-	ctx := t._underlyingConnection.shelf.getTransaction().getTransactionContext()
+	ctx := t.getTransactionContext()
+	unlock, err := t._underlyingConnection.shelf.synchronizer.begin(ctx)
+	if err != nil {
+		return t._underlyingConnection.shelf.LocalizeError(err)
+	}
+	// Another terminal transaction call may have won while this call waited
+	// for the physical TTC stream. Recheck ownership under exclusive stream
+	// access so Commit and Rollback cannot both reach the server.
+	if !t._underlyingConnection.shelf.isCurrentTransaction(t) {
+		unlock()
+		return t._underlyingConnection.shelf.LocalizeError(newNotInTransactionError())
+	}
+	common.Odl.Debug("Transaction commit")
 	readFuncError := t._underlyingConnection.runFunctionWithFunHeader(ctx, commit)
 
 	msgIn, _ := t._underlyingConnection.shelf.GetMessageStreamer().Drain(ctx, driverCommon.IN)
@@ -87,41 +104,57 @@ func (t *transaction) Commit() error {
 		common.Odl.Error("unexpected messages remained after query; invalidating connection",
 			"remaining messageCount", msgIn)
 		t._underlyingConnection.shelf.getEventService().post(streamerStaleEvent)
+		unlock()
 		return t._underlyingConnection.shelf.LocalizeError(common.NewOracleError(oracleErrors.InternalError, nil))
 	}
 
 	if readFuncError != nil {
+		unlock()
 		return t._underlyingConnection.shelf.LocalizeError(common.NewOracleError(oracleErrors.ErrorInTransaction, readFuncError, "Commit"))
 	}
 
-	t._underlyingConnection.shelf.unregisterTransaction()
+	t._underlyingConnection.shelf.unregisterTransaction(t)
+	unlock()
 	return nil
 }
 
-// Rollback rolls back the transaction
+// Rollback implements driver.Tx.Rollback. It rolls back using the driver's
+// background context, drains the complete TTC response, and unregisters the
+// transaction only after success.
 func (t *transaction) Rollback() error {
-	common.Odl.Debug("Transaction rollback")
-	if !t._underlyingConnection.shelf.isInTransaction() {
+	if !t._underlyingConnection.shelf.isCurrentTransaction(t) {
 		return t._underlyingConnection.shelf.LocalizeError(newNotInTransactionError())
 	}
+	ctx := common.BackgroundContext
+	unlock, err := t._underlyingConnection.shelf.synchronizer.begin(ctx)
+	if err != nil {
+		return t._underlyingConnection.shelf.LocalizeError(err)
+	}
+	if !t._underlyingConnection.shelf.isCurrentTransaction(t) {
+		unlock()
+		return t._underlyingConnection.shelf.LocalizeError(newNotInTransactionError())
+	}
+	common.Odl.Debug("Transaction rollback")
+	runFuncErr := t._underlyingConnection.runFunctionWithFunHeader(ctx, rollback)
 
-	runFuncErr := t._underlyingConnection.runFunctionWithFunHeader(common.BackgroundContext, rollback)
-
-	msgIn, _ := t._underlyingConnection.shelf.GetMessageStreamer().Drain(common.BackgroundContext, driverCommon.IN)
+	msgIn, _ := t._underlyingConnection.shelf.GetMessageStreamer().Drain(ctx, driverCommon.IN)
 	// no message should be left at this point
 	if msgIn != 0 {
 		// should drop connection.
 		common.Odl.Error("unexpected messages remained after query; invalidating connection",
 			"remaining messageCount", msgIn)
 		t._underlyingConnection.shelf.getEventService().post(streamerStaleEvent)
+		unlock()
 		return t._underlyingConnection.shelf.LocalizeError(common.NewOracleError(oracleErrors.InternalError, nil))
 	}
 
 	if runFuncErr != nil {
+		unlock()
 		return t._underlyingConnection.shelf.LocalizeError(common.NewOracleError(oracleErrors.ErrorInTransaction, runFuncErr, "Rollback"))
 	}
 
-	t._underlyingConnection.shelf.unregisterTransaction()
+	t._underlyingConnection.shelf.unregisterTransaction(t)
+	unlock()
 	return nil
 }
 

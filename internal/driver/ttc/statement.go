@@ -41,6 +41,9 @@ package ttc
 import (
 	"context"
 	"database/sql/driver"
+	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,7 +55,47 @@ import (
 const (
 	// The timeout for statement cancellation
 	cancelTimeout = time.Second * 10
+	// statementCloseTimeout bounds waiting for the physical TTC stream and
+	// flushing a cursor-close request from driver.Stmt.Close.
+	statementCloseTimeout = 10 * time.Second
 )
+
+// releaseLobBindsAfterExecution frees execution-scoped LOB locators only when
+// executionErr proves that the TTC stream can safely accept another RPC.
+//
+// Parameters:
+//   - cleanup: locators created while preparing streamed LOB binds.
+//   - executionErr: result of the statement's query or execution exchange.
+//
+// Returns:
+//   - error: executionErr, unless cleanup fails after a successful execution.
+func releaseLobBindsAfterExecution(cleanup *preparedLobBinds, executionErr error) error {
+	if cleanup == nil {
+		return executionErr
+	}
+	if executionErr != nil && !isCompletedLobResponseError(executionErr) && !isTerminalOracleError(executionErr) {
+		cleanup.abandon()
+		return executionErr
+	}
+	if cleanupErr := cleanup.free(); executionErr == nil {
+		return cleanupErr
+	}
+	return executionErr
+}
+
+// isTerminalOracleError reports whether err is an Oracle server error received
+// in a terminal TTIOER response. Statement executors return TTIOER errors
+// directly, so no error-tree traversal is required here.
+//
+// Parameters:
+//   - err: result of a statement query or execution exchange.
+//
+// Returns:
+//   - bool: true when err is a direct SQLError with an ORA error code.
+func isTerminalOracleError(err error) bool {
+	sqlErr, ok := err.(oracleErrors.SQLError)
+	return ok && strings.HasPrefix(sqlErr.ErrorCode(), "ORA-")
+}
 
 // statementCancellationContextKey stores per-execution cancellation state on a
 // statement context without colliding with caller-provided context values.
@@ -63,6 +106,7 @@ type statementCancellationContextKey struct{}
 type statementCancellationResult struct {
 	context.Context
 	context.CancelFunc
+	err error
 }
 
 // statementCancellationState coordinates one statement execution's cancellation
@@ -122,14 +166,38 @@ delivered; callers may use the error for logging/diagnostics.
 */
 type statemementCancellationFunction func(ctx context.Context) error
 
-// Statement represents a SQL statement bound to a connection and query text.
+// Statement is the physical-driver representation of one parsed SQL statement
+// and its Oracle cursor. It may be owned by database/sql as a prepared
+// statement or temporarily created by Connection.QueryContext/ExecContext.
+//
+// A successful direct query transfers Statement ownership to ttcRows. A
+// prepared query attaches Rows non-owningly so Rows.Close detaches the result
+// without destroying the reusable cursor. mu protects only close/result
+// ownership state; TTC traffic is serialized separately by the shelf operation
+// guard.
 type Statement struct {
-	shelf                  *ttiShelf[driverCommon.MessageType]
-	qualifiedQuery         *qualifiedSQLStatement
-	stmtCancellation       statemementCancellationFunction
+	// mu protects closed and _rows. It must not be held while entering Rows or
+	// performing TTC I/O to avoid Statement/Rows close lock cycles.
+	mu sync.Mutex
+	// closed makes Close idempotent and prevents duplicate cursor cleanup.
+	closed bool
+	// shelf is the physical connection's TTC dependency and lifetime registry.
+	shelf *ttiShelf[driverCommon.MessageType]
+	// sessionContext supplies negotiated character sets for streamed CLOB/NCLOB
+	// bind creation and conversion.
+	sessionContext *driverCommon.SessionContext
+	// qualifiedQuery contains parsed binds, SQL kind, text, and server cursor ID.
+	qualifiedQuery *qualifiedSQLStatement
+	// stmtCancellation performs the configured break/reset request. The field is
+	// retained for compatibility with existing statement construction.
+	stmtCancellation statemementCancellationFunction
+	// queryStatementExecutor owns SELECT protocol execution.
 	queryStatementExecutor QueryWithContext
-	execStatementExecutor  ExecWithContext
-	_rows                  *ttcRows // reference on created Rows.
+	// execStatementExecutor owns non-query protocol execution.
+	execStatementExecutor ExecWithContext
+	// _rows is the currently attached result. It is owning only when the matching
+	// ttcRows has ownsStatement set.
+	_rows *ttcRows // reference on created Rows.
 }
 
 /*
@@ -178,6 +246,7 @@ func newStatement(
 	}
 	stmt := &Statement{
 		shelf:                  shelf,
+		sessionContext:         sessionCtx,
 		qualifiedQuery:         classifiedQ,
 		queryStatementExecutor: queryExecutor,
 		execStatementExecutor:  execExecutor,
@@ -204,21 +273,66 @@ Implementation details:
 Callers must fully consume and Close the returned Rows.
 */
 func (s *Statement) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	return s.queryContext(ctx, args)
+}
+
+// queryContext executes Oracle bind values directly.
+func (s *Statement) queryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	if _, err := validateStreamedLobInputs(args); err != nil {
+		return nil, s.shelf.LocalizeError(err)
+	}
+	unlock, err := s.shelf.synchronizer.begin(ctx)
+	if err != nil {
+		return nil, s.shelf.LocalizeError(err)
+	}
+	defer unlock()
+
 	subContext, cancelSubContext, cleanup := s.createSubContextWithCancelAfterfunction(ctx)
 	defer cleanup()
 
-	if s.shelf.isInTransaction() {
+	if transaction := s.shelf.getTransaction(); transaction != nil {
 		// if in a transaction, add an after function on the transaction context
 		// that will cancel the statements context if the transaction context is
 		// cancelled triggering the break/reset protocol
-		stopTransAfterFunction := context.AfterFunc(s.shelf.getTransaction().getTransactionContext(), func() {
+		stopTransAfterFunction := context.AfterFunc(transaction.getTransactionContext(), func() {
 			cancelSubContext()
 		})
 		defer stopTransAfterFunction()
 	}
-	selectedRows, e := s.queryStatementExecutor.QueryContext(subContext, s.qualifiedQuery, args)
+	preparedArgs, lobCleanup, e := prepareStreamedLobBinds(subContext, s.shelf, s.sessionContext, args)
+	if e != nil {
+		return nil, s.shelf.LocalizeError(e)
+	}
+	selectedRows, e := s.queryStatementExecutor.QueryContext(subContext, s.qualifiedQuery, preparedArgs)
+	e = releaseLobBindsAfterExecution(lobCleanup, e)
+	if e != nil && selectedRows != nil {
+		_ = selectedRows.Close()
+		selectedRows = nil
+	}
 	if e == nil {
-		s._rows = selectedRows.(*ttcRows)
+		rows, ok := selectedRows.(*ttcRows)
+		if !ok || rows == nil {
+			if selectedRows != nil {
+				_ = selectedRows.Close()
+			}
+			e = common.NewOracleError(
+				oracleErrors.InternalError,
+				fmt.Errorf("query executor returned Rows type %T", selectedRows),
+			)
+		} else {
+			// Locator-backed values borrow Rows after this exchange-only subContext
+			// is cleaned up, so derive their lifetime from the original query ctx.
+			rows.setContext(ctx)
+			rows.attachStatement(s)
+			if !s.attachRows(rows) {
+				_ = rows.closeFromStatement(s)
+				e = common.NewOracleError(
+					oracleErrors.StatementExecutionFailed,
+					errors.New("statement closed while query was completing"),
+					"query",
+				)
+			}
+		}
 	}
 
 	msgIn, _ := s.shelf.GetMessageStreamer().Drain(ctx, driverCommon.IN)
@@ -231,11 +345,28 @@ func (s *Statement) QueryContext(ctx context.Context, args []driver.NamedValue) 
 		return nil, s.shelf.LocalizeError(common.NewOracleError(oracleErrors.InternalError, nil))
 	}
 
-	return selectedRows, s.shelf.LocalizeError(e)
+	if e != nil {
+		return nil, s.shelf.LocalizeError(e)
+	}
+	return selectedRows, nil
 }
 
 // _closeCursor closes the statement cursorID if not 0
 func (s *Statement) _closeCursor() error {
+	ctx, cancel := context.WithTimeout(context.Background(), statementCloseTimeout)
+	defer cancel()
+
+	unlock, err := s.shelf.synchronizer.begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return s.closeCursorLocked(ctx)
+}
+
+// closeCursorLocked closes the cursor while the caller owns the shelf
+// operation guard.
+func (s *Statement) closeCursorLocked(ctx context.Context) error {
 	if s.qualifiedQuery.cursorId == 0 {
 		return nil
 	}
@@ -251,10 +382,16 @@ func (s *Statement) _closeCursor() error {
 	occaMsg := msg.(*tTIOcca)
 	occaMsg.setCursorIDs([]driverCommon.UB4{driverCommon.UB4(s.qualifiedQuery.cursorId)})
 
-	// Push (no flush; keep existing previous behavior).
+	// OCCA is a one-way cursor cleanup request, but it must be flushed before the
+	// connection can be returned to the pool. Otherwise a later operation could
+	// accidentally carry this statement's cleanup in its own exchange.
 	stmr := s.shelf.GetMessageStreamer().(MessageStreamerInterface)
-	if err := stmr.Push(context.Background(), occaMsg); err != nil {
+	if err := stmr.Push(ctx, occaMsg); err != nil {
 		common.Odl.Error("Statement.Close: Push(OCCA) failed", "error", err)
+		return s.shelf.LocalizeError(err)
+	}
+	if err := stmr.Flush(ctx); err != nil {
+		common.Odl.Error("Statement.Close: Flush(OCCA) failed", "error", err)
 		return s.shelf.LocalizeError(err)
 	}
 	s.qualifiedQuery.cursorId = 0
@@ -263,22 +400,34 @@ func (s *Statement) _closeCursor() error {
 
 // Close implements driver.Stmt.Close.
 func (s *Statement) Close() error {
-	var finalErr oracleErrors.SQLError
-
-	//  close the associated rows if any
-	if s._rows != nil {
-		err := s._rows.Close()
-		if err != nil {
-			common.Odl.Debug("Failed to close rows", "error", err)
-			finalErr = s.shelf.LocalizeError(common.NewOracleError(oracleErrors.RowsCloseFailed, err)).(oracleErrors.SQLError)
-		}
-		s._rows = nil
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
 	}
-	// close cursors
-	err := s._closeCursor()
-	if err != nil {
-		common.Odl.Debug("Failed to close statement", "error", err)
-		finalErr = s.shelf.LocalizeError(common.NewOracleError(oracleErrors.StatementCloseFailed, err)).(oracleErrors.SQLError)
+	s.closed = true
+	rows := s._rows
+	s._rows = nil
+	s.mu.Unlock()
+
+	var finalErr error
+
+	// Mark associated Rows closed without allowing it to recursively close this
+	// Statement. The cursor is closed below exactly once.
+	if rows != nil {
+		finalErr = rows.closeFromStatement(s)
+	}
+	// Do not queue cursor traffic after temporary-LOB cleanup made the session
+	// unusable. Connection teardown will release the cursor in that case.
+	if finalErr == nil {
+		err := s._closeCursor()
+		if err != nil {
+			common.Odl.Debug("Failed to close statement", "error", err)
+			// The cursor-close exchange did not complete. Do not allow database/sql to
+			// reuse a session whose outgoing TTC state may be ambiguous.
+			s.shelf.getEventService().post(streamerStaleEvent)
+			finalErr = s.shelf.LocalizeError(common.NewOracleError(oracleErrors.StatementCloseFailed, err))
+		}
 	}
 
 	s.shelf.RemoveStatement(s)
@@ -286,9 +435,41 @@ func (s *Statement) Close() error {
 	return finalErr
 }
 
-// NumInput implements driver.Stmt.NumInput. -1 indicates unknown/variadic.
+// attachRows records the result produced by the latest execution. It returns
+// false when Close already won the lifecycle race, allowing the caller to
+// invalidate the result instead of attaching Rows to a closed Statement.
+func (s *Statement) attachRows(rows *ttcRows) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return false
+	}
+	s._rows = rows
+	return true
+}
+
+// detachRows clears only the matching result, allowing a prepared Statement to
+// remain open and reusable after its Rows close.
+func (s *Statement) detachRows(rows *ttcRows) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s._rows == rows {
+		s._rows = nil
+	}
+}
+
+// closeAfterRows finalizes an internally-created direct-query Statement after
+// its owning Rows has already detached itself.
+func (s *Statement) closeAfterRows() error {
+	return s.Close()
+}
+
+// NumInput implements driver.Stmt.NumInput. It returns -1 so database/sql does
+// not reject a QueryContext call before the driver's parsed-placeholder
+// validation enforces the actual SQL bind count and names before any TTC
+// exchange.
 func (s *Statement) NumInput() int {
-	return len(s.qualifiedQuery.binds.bindNames)
+	return -1
 }
 
 // CheckNamedValue allows sql.Out binds to pass through database/sql conversion.
@@ -313,19 +494,38 @@ Implementation details:
 The returned Result may expose rows-affected metadata when the server provides it.
 */
 func (s *Statement) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	return s.execContext(ctx, args)
+}
+
+// execContext executes Oracle bind values.
+func (s *Statement) execContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	if _, err := validateStreamedLobInputs(args); err != nil {
+		return nil, s.shelf.LocalizeError(err)
+	}
+	unlock, err := s.shelf.synchronizer.begin(ctx)
+	if err != nil {
+		return nil, s.shelf.LocalizeError(err)
+	}
+	defer unlock()
+
 	subContext, cancelSubContext, cleanup := s.createSubContextWithCancelAfterfunction(ctx)
 	defer cleanup()
 
-	if s.shelf.isInTransaction() {
+	if transaction := s.shelf.getTransaction(); transaction != nil {
 		// if in a transaction, add an after function on the transaction context
 		// that will cancel the statements context if the transaction context is
 		// cancelled triggering the break/reset protocol
-		stopTransAfterFunction := context.AfterFunc(s.shelf.getTransaction().getTransactionContext(), func() {
+		stopTransAfterFunction := context.AfterFunc(transaction.getTransactionContext(), func() {
 			cancelSubContext()
 		})
 		defer stopTransAfterFunction()
 	}
-	result, err := s.execStatementExecutor.ExecContext(subContext, s.qualifiedQuery, args)
+	preparedArgs, lobCleanup, err := prepareStreamedLobBinds(subContext, s.shelf, s.sessionContext, args)
+	if err != nil {
+		return nil, s.shelf.LocalizeError(err)
+	}
+	result, err := s.execStatementExecutor.ExecContext(subContext, s.qualifiedQuery, preparedArgs)
+	err = releaseLobBindsAfterExecution(lobCleanup, err)
 	// no message should be left at this point
 	msgIn, _ := s.shelf.GetMessageStreamer().Drain(ctx, driverCommon.IN)
 	// no message should be left at this point
@@ -384,42 +584,5 @@ func (s *Statement) Query(args []driver.Value) (driver.Rows, error) {
 //   - function that cancels the sub-context
 //   - cleanup function that stops or releases the cancellation after-function
 func (s *Statement) createSubContextWithCancelAfterfunction(ctx context.Context) (context.Context, context.CancelFunc, func()) {
-	cancellationState := newStatementCancellationState()
-	subContext := context.WithValue(ctx, statementCancellationContextKey{}, cancellationState)
-
-	common.Odl.Debug("Creating cancellable sub context")
-	subContext, cancelSubContext := context.WithCancel(subContext)
-
-	// attach and after function to the new context
-	stop := context.AfterFunc(subContext, func() {
-		defer close(cancellationState.done)
-		ctx, cancel := context.WithTimeout(context.Background(), cancelTimeout)
-		// Wait until we can start
-		common.Odl.Debug("Break-reset after function started")
-		close(cancellationState.started)
-		if start := <-cancellationState.start; !start {
-			cancel()
-			return
-		}
-		common.Odl.Debug("Start break-reset")
-		err := s.shelf.cancelExecution(ctx)
-		if err != nil {
-			common.Odl.Error("Error during statement cancellation.", "error", err)
-		}
-		common.Odl.Debug("Break-reset completed")
-		// Allow statement execution to continue
-		cancellationState.completed <- statementCancellationResult{ctx, cancel}
-	})
-	var cleanupOnce sync.Once
-	cleanup := func() {
-		cleanupOnce.Do(func() {
-			if !stop() {
-				cancellationState.abortBreakReset()
-				<-cancellationState.done
-			}
-			cancelSubContext()
-		})
-	}
-	// return the subcontext, its cancel function, and after-function cleanup
-	return subContext, cancelSubContext, cleanup
+	return s.shelf.cancellation.newCancelableOperationContext(ctx, s.shelf.cancelExecution)
 }

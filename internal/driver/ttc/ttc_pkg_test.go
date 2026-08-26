@@ -54,6 +54,7 @@ import (
 	"time"
 
 	"github.com/oracle/go-oracledb/v26/internal/driver/common"
+	oracleErrors "github.com/oracle/go-oracledb/v26/oracle/errors"
 )
 
 // TestCategory category of tests to be un
@@ -62,6 +63,17 @@ var TestCategory string
 func TestMain(m *testing.M) {
 	flag.StringVar(&TestCategory, "test.category", "", "testing category, can be unitary, functional, performance, robustness")
 	os.Exit(m.Run())
+}
+
+// requireErrorCode verifies that err or one of its wrapped errors implements
+// oracleErrors.SQLError with the expected stable error code.
+func requireErrorCode(t testing.TB, err error, want oracleErrors.ErrorCode) {
+	t.Helper()
+	var sqlErr oracleErrors.SQLError
+	ok := errors.As(err, &sqlErr)
+	if !ok || sqlErr.ErrorCode() != string(want) {
+		t.Fatalf("error = %T %v, want driver error code %s", err, err, want)
+	}
 }
 
 var testCases = []struct {
@@ -81,6 +93,7 @@ var testCases = []struct {
 	{"TestConnectionCloser_Close", "unitary", false, TestConnectionCloser_Close},
 	{"TestConnectionCloser_CloseWithTimeout", "unitary", false, TestConnectionCloser_CloseWithTimeout},
 	{"TestEventServiceRegisterAndPost", "unitary", false, TestEventServiceRegisterAndPost},
+	{"TestEventService_ConcurrentRegisterAndPost", "unitary", false, TestEventService_ConcurrentRegisterAndPost},
 	{"TestAuthencationFactoryWithNilParameters", "unitary", false, TestAuthencationFactoryWithNilParameters},
 	{"TestAuthencationFactoryBasic", "unitary", false, TestAuthencationFactoryBasic},
 	{"TestGetConnection", "unitary", false, TestGetConnection},
@@ -88,6 +101,7 @@ var testCases = []struct {
 	{"TestConnectionPinger_IsValid", "unitary", false, TestConnectionPinger_IsValid},
 	{"TestConnectionPinger_IsValidWithInband", "unitary", false, TestConnectionPinger_IsValidWithInband},
 	{"TestFactoryRegistries", "unitary", false, TestFactoryRegistries},
+	{"TestRegistry_ConcurrentRegisterAndLookup", "unitary", false, TestRegistry_ConcurrentRegisterAndLookup},
 	{"TestReplaceMessage", "unitary", false, TestReplaceMessage},
 	{"TestFactoryGetMessage", "unitary", false, TestFactoryGetMessage},
 	{"TestFactoryGetMessageFromFunction", "unitary", false, TestFactoryGetMessageFromFunction},
@@ -431,6 +445,9 @@ var testCases = []struct {
 	{"TestCodecFactory_getEncoder", "unitary", false, TestCodecFactory_getEncoder},
 	{"TestCodecFactory_getDecoder", "unitary", false, TestCodecFactory_getDecoder},
 	{"TestCodecFactory_RegisterEncoderGeneric", "unitary", false, TestCodecFactory_RegisterEncoderGeneric},
+	{"TestTTIShelf_SessionSynchronizerSerializesAccess", "unitary", false, TestTTIShelf_SessionSynchronizerSerializesAccess},
+	{"TestTTIShelf_SessionSynchronizerAcquisitionHonorsContext", "unitary", false, TestTTIShelf_SessionSynchronizerAcquisitionHonorsContext},
+	{"TestTTIShelf_ConcurrentStatementRegistry", "unitary", false, TestTTIShelf_ConcurrentStatementRegistry},
 	{"TestTTIShelf_NewShelf", "unitary", false, TestTTIShelf_NewShelf},
 	{"TestTTIShelf_RegisterCodecFactoryAndGetter", "unitary", false, TestTTIShelf_RegisterCodecFactoryAndGetter},
 
@@ -457,7 +474,9 @@ var testCases = []struct {
 	{"TestClobExecutor_CreateTemporaryLobErrors", "unitary", false, TestClobExecutor_CreateTemporaryLobErrors},
 	{"TestClobExecutor_Write", "unitary", false, TestClobExecutor_Write},
 	{"TestClobExecutor_WriteErrors", "unitary", false, TestClobExecutor_WriteErrors},
+	{"TestClobExecutor_CLOBAndNCLOBAmountsUseUCS2Units", "unitary", false, TestClobExecutor_CLOBAndNCLOBAmountsUseUCS2Units},
 	{"TestClobExecutor_Read", "unitary", false, TestClobExecutor_Read},
+	{"TestClobExecutor_DecodeReadPayloadRejectsIncompleteCharacter", "unitary", false, TestClobExecutor_DecodeReadPayloadRejectsIncompleteCharacter},
 	{"TestClobExecutor_ReadErrors", "unitary", false, TestClobExecutor_ReadErrors},
 	{"TestClobExecutor_IsOpen", "unitary", false, TestClobExecutor_IsOpen},
 	{"TestClobExecutor_IsOpenErrors", "unitary", false, TestClobExecutor_IsOpenErrors},
@@ -468,19 +487,31 @@ var testCases = []struct {
 	{"TestLobExecutor_ConsumeLobResponses_DelayedOER", "unitary", false, TestLobExecutor_ConsumeLobResponses_DelayedOER},
 	{"TestLobExecutor_ConsumeLobResponses_OERTermination", "unitary", false, TestLobExecutor_ConsumeLobResponses_OERTermination},
 	{"TestLobExecutor_ConsumeLobResponses_PullError", "unitary", false, TestLobExecutor_ConsumeLobResponses_PullError},
+	{"TestLobBindPipeline_CanceledLobExchangeUsesBreakResetAndRestoresStream", "unitary", false, TestLobBindPipeline_CanceledLobExchangeUsesBreakResetAndRestoresStream},
+	{"TestLobBindPipeline_CanceledLobExchangeDiscardsStreamWhenRecoveryFails", "unitary", false, TestLobBindPipeline_CanceledLobExchangeDiscardsStreamWhenRecoveryFails},
 	{"TestClobExecutor_ReadNCLOB", "unitary", false, TestClobExecutor_ReadNCLOB},
 	{"TestConnection_FaultyOnDrain", "unitary", false, TestConnection_FaultyOnDrain},
 	{"TestConnection_FaultyOnDrainInStatement", "unitary", false, TestConnection_FaultyOnDrainInStatement},
 	{"TestClobExecutor_WriteNCLOB", "unitary", false, TestClobExecutor_WriteNCLOB},
 	{"TestBlobExecutor_CreateTemporaryLob", "unitary", false, TestBlobExecutor_CreateTemporaryLob},
+	{"TestBlobExecutor_TemporaryOpenCloseIsOpen", "unitary", false, TestBlobExecutor_TemporaryOpenCloseIsOpen},
+	{"TestBlobExecutor_ReadRejectsAmountOutsideGoBufferRange", "unitary", false, TestBlobExecutor_ReadRejectsAmountOutsideGoBufferRange},
 	{"TestBlobExecutor_Write", "unitary", false, TestBlobExecutor_Write},
 	{"TestBlobExecutor_Read", "unitary", false, TestBlobExecutor_Read},
 	{"TestBlobExecutor_Errors", "unitary", false, TestBlobExecutor_Errors},
+	{"TestTempLobRegistry_ReferenceCountDefersFreeUntilLastAlias", "unitary", false, TestTempLobRegistry_ReferenceCountDefersFreeUntilLastAlias},
+	{"TestTempLobRegistry_LastReleasePiggybacksBeforeNextFunction", "unitary", false, TestTempLobRegistry_LastReleasePiggybacksBeforeNextFunction},
+	{"TestTempLobRegistry_ArrayPiggybackMarshalsWithOrdinaryFunction", "unitary", false, TestTempLobRegistry_ArrayPiggybackMarshalsWithOrdinaryFunction},
+	{"TestTempLobRegistry_PiggybackBatchesPendingLocators", "unitary", false, TestTempLobRegistry_PiggybackBatchesPendingLocators},
+	{"TestTempLobRegistry_LogoffDiscardsPendingFree", "unitary", false, TestTempLobRegistry_LogoffDiscardsPendingFree},
+	{"TestTempLobRegistry_UsesStableLobIDNotMutableFlags", "unitary", false, TestTempLobRegistry_UsesStableLobIDNotMutableFlags},
+	{"TestTempLobRegistry_ReferenceRejectsLocatorWithoutCompleteID", "unitary", false, TestTempLobRegistry_ReferenceRejectsLocatorWithoutCompleteID},
 
 	{"TestConnection_InvalidateOnOEROrSTA", "unitary", false, TestConnection_InvalidateOnOEROrSTA},
 	{"TestTransactionCommitSuccess", "unitary", false, TestTransactionCommitSuccess},
 	{"TestTransactionRollbackSuccess", "unitary", false, TestTransactionRollbackSuccess},
 	{"TestCallBeginTxTwice", "unitary", false, TestCallBeginTxTwice},
+	{"TestConnectionTransaction_ConcurrentTerminationExecutesOnce", "unitary", false, TestConnectionTransaction_ConcurrentTerminationExecutesOnce},
 
 	{"TestStatementExecutorExec_HandleRXDRow_UsesScannerDestination", "unitary", false, TestStatementExecutorExec_HandleRXDRow_UsesScannerDestination},
 	{"TestStatementExecutorExec_HandleRXDRow_PropagatesScannerError", "unitary", false, TestStatementExecutorExec_HandleRXDRow_PropagatesScannerError},
@@ -491,6 +522,7 @@ var testCases = []struct {
 	{"TestAuthRPARejectsOversizedKeyValueListAllocations", "unitary", false, TestAuthRPARejectsOversizedKeyValueListAllocations},
 	{"TestCodecFactory_getBindOac", "unitary", false, TestCodecFactory_getBindOac},
 	{"TestCodecFactory_getDefineOac", "unitary", false, TestCodecFactory_getDefineOac},
+	{"TestCodecFactory_GetDefineOacUsesConnectionLobPrefetch", "unitary", false, TestCodecFactory_GetDefineOacUsesConnectionLobPrefetch},
 	{"TestConnectionResetter_Reset", "unitary", false, TestConnectionResetter_Reset},
 	{"TestConnection_ExecContext_LocalizesError", "unitary", false, TestConnection_ExecContext_LocalizesError},
 	{"TestConnection_LocalizationStaysBoundToEachShelf", "unitary", false, TestConnection_LocalizationStaysBoundToEachShelf},
@@ -925,7 +957,6 @@ func (t *TestDataBuffer) WriteBytesWithContext(ctx context.Context, b []byte) er
 
 // Flush the test buffer
 func (t *TestDataBuffer) Flush(ctx context.Context) error {
-	fmt.Printf("Flush called ... \n")
 	if t.OnFlush != nil {
 		t.OnFlush(t)
 	}
@@ -958,13 +989,14 @@ func (t *TestDataBuffer) ReadBytesWithContext(ctx context.Context, n int32) (*[]
 
 // mockStreamer implements common.Streamer[common.MessageType] for testing
 type mockStreamer struct {
-	pushCalled bool
-	pushedMsg  list.List
-	pushErr    error
-	pullCalled bool
-	pullTypes  []common.MessageType
-	pullMsg    common.Message[common.MessageType]
-	pullErr    error
+	pushCalled  bool
+	pushedMsg   list.List
+	pushErr     error
+	flushCalled bool
+	pullCalled  bool
+	pullTypes   []common.MessageType
+	pullMsg     common.Message[common.MessageType]
+	pullErr     error
 }
 
 // wrapped mock stream combines both a pre-filled message incoming queue
@@ -1038,6 +1070,7 @@ func (m *mockStreamer) Pull(_ context.Context, types ...common.MessageType) (com
 }
 
 func (m *mockStreamer) Flush(_ context.Context) error {
+	m.flushCalled = true
 	return nil
 }
 

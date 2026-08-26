@@ -42,10 +42,12 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"math"
 	"strings"
 	"testing"
 
-	"github.com/oracle/go-driver/driver/common"
+	driverCommon "github.com/oracle/go-oracledb/v26/internal/driver/common"
+	oracleErrors "github.com/oracle/go-oracledb/v26/oracle/errors"
 )
 
 // TestBlobExecutor_CreateTemporaryLob verifies the BLOB-specific temporary
@@ -53,13 +55,13 @@ import (
 func TestBlobExecutor_CreateTemporaryLob(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	const duration common.UB4 = 10
+	const duration driverCommon.UB4 = 10
 
 	// Step 1: verify the definition values required specifically for a BLOB.
-	def := NewLobDefinitionForTemporaryCreate(
+	def := newLobDefinitionForTemporaryCreate(
 		kolllTempWithSignature,
 		blobFormOfUse,
-		common.UB8(DtyBlob),
+		driverCommon.UB8(DtyBlob),
 		duration,
 		true,
 		blobCharsetIDPlaceholder,
@@ -67,16 +69,16 @@ func TestBlobExecutor_CreateTemporaryLob(t *testing.T) {
 	if def.operation != kplobTmpCreate {
 		t.Fatalf("operation = %v, want %v", def.operation, kplobTmpCreate)
 	}
-	if def.sourceLocator.offset != common.UB8(blobFormOfUse) {
+	if def.sourceLocator.offset != driverCommon.UB8(blobFormOfUse) {
 		t.Fatalf("form-of-use = %d, want %d", def.sourceLocator.offset, blobFormOfUse)
 	}
-	if def.destinationLocator.offset != common.UB8(DtyBlob) {
+	if def.destinationLocator.offset != driverCommon.UB8(DtyBlob) {
 		t.Fatalf("LOB type = %d, want DtyBlob (%d)", def.destinationLocator.offset, DtyBlob)
 	}
 	if def.charsetID != blobCharsetIDPlaceholder {
 		t.Fatalf("charset ID = %d, want BLOB protocol placeholder %d", def.charsetID, blobCharsetIDPlaceholder)
 	}
-	if def.destinationLength != common.SB4(duration) || def.lobAmt != common.UB8(duration) {
+	if def.destinationLength != driverCommon.SB4(duration) || def.lobAmt != driverCommon.UB8(duration) {
 		t.Fatalf("duration fields = (%d, %d), want (%d, %d)", def.destinationLength, def.lobAmt, duration, duration)
 	}
 	if len(def.lobscn) != 1 || def.lobscn[0] != 1 {
@@ -90,10 +92,10 @@ func TestBlobExecutor_CreateTemporaryLob(t *testing.T) {
 	// Step 2: stage a minimal successful TTIRPA containing a complete temporary
 	// locator, charset placeholder, returned duration, and non-NULL status.
 	shelf, _, dbuf := newLobTestShelf(4096)
-	wantLocator := make(common.B1Array, kolllTempWithSignature)
+	wantLocator := make(driverCommon.B1Array, kolllTempWithSignature)
 	copy(wantLocator[:2], wantHeader)
 	wantLocator[2] = 0xA5
-	response := append(common.B1Array{byte(TTIRPA)}, wantLocator...)
+	response := append(driverCommon.B1Array{byte(TTIRPA)}, wantLocator...)
 	response = append(response,
 		0x01, byte(blobCharsetIDPlaceholder),
 		0x01, byte(duration),
@@ -105,7 +107,7 @@ func TestBlobExecutor_CreateTemporaryLob(t *testing.T) {
 	marshalWritePosition := dbuf.currentWritePosition
 
 	// Step 3: execute the production API and verify the returned locator.
-	gotLocator, err := NewBlobExecutor(shelf).CreateTemporaryLob(ctx, true, duration)
+	gotLocator, err := newBlobExecutor(shelf).createTemporaryLob(ctx, true, duration)
 	if err != nil {
 		t.Fatalf("CreateTemporaryLob() error = %v", err)
 	}
@@ -121,19 +123,63 @@ func TestBlobExecutor_CreateTemporaryLob(t *testing.T) {
 	}
 }
 
+// TestBlobExecutor_TemporaryOpenCloseIsOpen verifies the local lifecycle used
+// by temporary locators: Open marks the locator, IsOpen observes that mark,
+// and Close clears it without issuing an additional TTC RPC.
+func TestBlobExecutor_TemporaryOpenCloseIsOpen(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	locatorBytes := newTestLocator(false)
+	locatorBytes[koll1FlagOffset] = kolblBlobFlag
+	locatorBytes[koll4FlagOffset] |= kolblTemporaryFlagByte
+	loc := newLocator(locatorBytes, 1)
+	executor := newBlobExecutor(&driverCommon.Shelf[driverCommon.MessageType]{})
+
+	// Step 1: opening a temporary locator is a local flag transition.
+	opened, err := executor.open(ctx, loc, lobOpenModeReadWrite)
+	if err != nil || !opened || !loc.isOpenLocator() {
+		t.Fatalf("Open() = (%t, %v), locator open = %t; want (true, nil, true)", opened, err, loc.isOpenLocator())
+	}
+
+	// Step 2: IsOpen must read the same local locator state.
+	isOpen, err := executor.isOpen(ctx, loc)
+	if err != nil || !isOpen {
+		t.Fatalf("IsOpen() = (%t, %v), want (true, nil)", isOpen, err)
+	}
+
+	// Step 3: Close clears the local open/access flags and IsOpen follows it.
+	if err := executor.close(ctx, loc); err != nil {
+		t.Fatalf("Close() error = %v", err)
+	}
+	isOpen, err = executor.isOpen(ctx, loc)
+	if err != nil || isOpen || loc.isOpenLocator() {
+		t.Fatalf("IsOpen() after Close = (%t, %v), locator open = %t; want (false, nil, false)", isOpen, err, loc.isOpenLocator())
+	}
+}
+
+// TestBlobExecutor_ReadRejectsAmountOutsideGoBufferRange verifies Read rejects
+// amounts that cannot be represented as a Go buffer length.
+func TestBlobExecutor_ReadRejectsAmountOutsideGoBufferRange(t *testing.T) {
+	t.Parallel()
+
+	maximum := driverCommon.UB8(math.MaxInt)
+	_, _, err := (&blobExecutor{}).read(context.Background(), nil, maximum+1)
+	requireErrorCode(t, err, oracleErrors.InvalidLOBBuffer)
+}
+
 // TestBlobExecutor_Write verifies that Write emits the BLOB OLOBOPS request
 // followed by an exact TTILOBD copy of a small binary payload.
 func TestBlobExecutor_Write(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	payload := common.B1Array{0x00, 0xFF, 0x10}
+	payload := driverCommon.B1Array{0x00, 0xFF, 0x10}
 	locatorBytes := newTestLocator(false)
 	locatorBytes[koll1FlagOffset] = kolblBlobFlag
 
 	// Step 1: stage a minimal TTIRPA response containing the returned locator
 	// and byte count. The test shelf supplies the terminal successful OER.
 	shelf, _, dbuf := newLobTestShelf(1024)
-	response := append(common.B1Array{byte(TTIRPA)}, locatorBytes...)
+	response := append(driverCommon.B1Array{byte(TTIRPA)}, locatorBytes...)
 	response = append(response, 0x01, byte(len(payload)))
 	if err := dbuf.WriteBytesWithContext(ctx, response); err != nil {
 		t.Fatalf("stage BLOB write response: %v", err)
@@ -141,15 +187,15 @@ func TestBlobExecutor_Write(t *testing.T) {
 	marshalWritePosition := dbuf.currentWritePosition
 
 	// Step 2: execute Write with bytes that cannot be mistaken for text.
-	written, err := NewBlobExecutor(shelf).Write(
+	written, err := newBlobExecutor(shelf).write(
 		ctx,
-		newLocator(append(common.B1Array(nil), locatorBytes...), 1),
+		newLocator(append(driverCommon.B1Array(nil), locatorBytes...), 1),
 		payload,
 	)
 	if err != nil {
 		t.Fatalf("Write() error = %v", err)
 	}
-	if written != common.UB8(len(payload)) {
+	if written != driverCommon.UB8(len(payload)) {
 		t.Fatalf("Write() = %d bytes, want %d", written, len(payload))
 	}
 
@@ -168,13 +214,13 @@ func TestBlobExecutor_Write(t *testing.T) {
 func TestBlobExecutor_Read(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	want := common.B1Array{0x00, 0xFF, 0x10, 0x80, 0x41, 0x00, 0x7F}
+	want := driverCommon.B1Array{0x00, 0xFF, 0x10, 0x80, 0x41, 0x00, 0x7F}
 	locatorBytes := newTestLocator(false)
 	locatorBytes[koll1FlagOffset] = kolblBlobFlag
 
 	// Step 1: build a minimal response containing one short binary TTILOBD
 	// frame followed by TTIRPA locator and amount fields.
-	response := make(common.B1Array, 0, 4+len(want)+len(locatorBytes))
+	response := make(driverCommon.B1Array, 0, 4+len(want)+len(locatorBytes))
 	response = append(response, byte(TTILOBD), byte(len(want)))
 	response = append(response, want...)
 	response = append(response, byte(TTIRPA))
@@ -190,23 +236,21 @@ func TestBlobExecutor_Read(t *testing.T) {
 	marshalWritePosition := dbuf.currentWritePosition
 
 	// Step 3: use a BLOB locator and execute the production read path.
-	out := make(common.B1Array, len(want))
-	read, err := NewBlobExecutor(shelf).Read(
+	payload, read, err := newBlobExecutor(shelf).read(
 		ctx,
-		newLocator(append(common.B1Array(nil), locatorBytes...), 1),
-		common.UB8(len(out)),
-		out,
+		newLocator(append(driverCommon.B1Array(nil), locatorBytes...), 1),
+		driverCommon.UB8(len(want)),
 	)
 	if err != nil {
 		t.Fatalf("Read() error = %v", err)
 	}
 
 	// Step 4: verify both the reported amount and every transferred byte.
-	if read != common.UB8(len(want)) {
+	if read != driverCommon.UB8(len(want)) {
 		t.Fatalf("Read() = %d bytes, want %d", read, len(want))
 	}
-	if !bytes.Equal(out[:read], want) {
-		t.Fatalf("Read() payload mismatch:\n got: % X\nwant: % X", out[:read], want)
+	if !bytes.Equal(payload, want) {
+		t.Fatalf("Read() payload mismatch:\n got: % X\nwant: % X", payload, want)
 	}
 
 	// Step 5: compare the complete request with the fixed read golden payload.
@@ -217,6 +261,26 @@ func TestBlobExecutor_Read(t *testing.T) {
 	}
 }
 
+// TestBlobExecutor_ReadRejectsOversizedServerResponse verifies that a TTILOBD
+// frame that exceeds the requested BLOB buffer is reported as a LOB execution
+// error after the shared executor wraps the protocol validation failure.
+func TestBlobExecutor_ReadRejectsOversizedServerResponse(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	locatorBytes := newTestLocator(false)
+	locatorBytes[koll1FlagOffset] = kolblBlobFlag
+
+	// The two-byte LOBD frame cannot fit in the one-byte request buffer.
+	response := driverCommon.B1Array{byte(TTILOBD), 0x02, 0x01, 0x02}
+	shelf, _, dbuf := newLobTestShelf(8192)
+	if err := dbuf.WriteBytesWithContext(ctx, response); err != nil {
+		t.Fatalf("stage oversized BLOB response: %v", err)
+	}
+
+	_, _, err := newBlobExecutor(shelf).read(ctx, newLocator(locatorBytes, 1), 1)
+	requireErrorCode(t, err, oracleErrors.LobExecError)
+}
+
 // TestBlobExecutor_Errors verifies BLOB-specific validation and transport
 // failure propagation for temporary creation and binary streaming.
 func TestBlobExecutor_Errors(t *testing.T) {
@@ -224,25 +288,26 @@ func TestBlobExecutor_Errors(t *testing.T) {
 
 	t.Run("rejects BFILE-only open mode", func(t *testing.T) {
 		// Step 1: pass a BFILE mode to a BLOB executor.
-		_, err := NewBlobExecutor(&common.Shelf[common.MessageType]{}).Open(ctx, newLocator(newTestLocator(false), 0), BfileOpenModeReadOnly)
+		_, err := newBlobExecutor(&driverCommon.Shelf[driverCommon.MessageType]{}).open(ctx, newLocator(newTestLocator(false), 0), bfileOpenModeReadOnly)
 
 		// Step 2: ensure the public API returns the documented validation error.
-		if code := getErrorCode(err); code != string(common.InvalidLOBBuffer) || !strings.Contains(err.Error(), "unsupported BFILE open mode") {
-			t.Fatalf("Open(BFILE mode) error = %v; want InvalidLOBBuffer", err)
+		requireErrorCode(t, err, oracleErrors.UnsupportedLobOperation)
+		if !strings.Contains(err.Error(), "BFILE open") {
+			t.Fatalf("Open(BFILE mode) error = %v; want UnsupportedLobOperation", err)
 		}
 	})
 
 	for _, tt := range []struct {
 		name string
-		run  func(*BlobExecutor) error
+		run  func(*blobExecutor) error
 	}{
-		{"temporary create", func(e *BlobExecutor) error { _, err := e.CreateTemporaryLob(ctx, false, 1); return err }},
-		{"write", func(e *BlobExecutor) error {
-			_, err := e.Write(ctx, newLocator(newTestLocator(false), 0), common.B1Array{1})
+		{"temporary create", func(e *blobExecutor) error { _, err := e.createTemporaryLob(ctx, false, 1); return err }},
+		{"write", func(e *blobExecutor) error {
+			_, err := e.write(ctx, newLocator(newTestLocator(false), 0), driverCommon.B1Array{1})
 			return err
 		}},
-		{"read", func(e *BlobExecutor) error {
-			_, err := e.Read(ctx, newLocator(newTestLocator(false), 0), 1, make(common.B1Array, 1))
+		{"read", func(e *blobExecutor) error {
+			_, _, err := e.read(ctx, newLocator(newTestLocator(false), 0), 1)
 			return err
 		}},
 	} {
@@ -252,54 +317,53 @@ func TestBlobExecutor_Errors(t *testing.T) {
 			err := tt.run(exec)
 
 			// Step 2: verify callers receive the standard LOB execution classification.
-			if code := getErrorCode(err); code != string(common.LobExecError) {
-				t.Fatalf("%s error code = %q, want %q (error: %v)", tt.name, code, common.LobExecError, err)
-			}
+			requireErrorCode(t, err, oracleErrors.LobExecError)
 		})
 	}
 
 	for _, locatorCase := range []struct {
 		name      string
-		configure func(common.B1Array)
+		configure func(driverCommon.B1Array)
 		detail    string
 	}{
-		{"value-based", func(l common.B1Array) { l[koll1FlagOffset] = kolblValueBasedLocatorFlag }, "value-based"},
-		{"read-only", func(l common.B1Array) { l[koll3FlagOffset] = kolblReadOnlyFlag }, "read-only"},
+		{"value-based", func(l driverCommon.B1Array) { l[koll1FlagOffset] = kolblValueBasedLocatorFlag }, "value-based"},
+		{"read-only", func(l driverCommon.B1Array) { l[koll3FlagOffset] = kolblReadOnlyFlag }, "read-only"},
 	} {
 		t.Run("rejects "+locatorCase.name+" locator for write", func(t *testing.T) {
 			// Step 1: mark the locator as incapable of a BLOB write.
 			locatorBytes := newTestLocator(false)
 			locatorCase.configure(locatorBytes)
-			_, err := NewBlobExecutor(&common.Shelf[common.MessageType]{}).Write(
+			_, err := newBlobExecutor(&driverCommon.Shelf[driverCommon.MessageType]{}).write(
 				ctx,
 				newLocator(locatorBytes, 0),
-				common.B1Array{1},
+				driverCommon.B1Array{1},
 			)
 
 			// Step 2: verify validation fails before any TTC operation is attempted.
-			if code := getErrorCode(err); code != string(common.InvalidLOBBuffer) || !strings.Contains(err.Error(), locatorCase.detail) {
+			requireErrorCode(t, err, oracleErrors.InvalidLOBBuffer)
+			if !strings.Contains(err.Error(), locatorCase.detail) {
 				t.Fatalf("Write() error = %v; want InvalidLOBBuffer for %s locator", err, locatorCase.name)
 			}
 		})
 	}
 }
 
-// newBlobExecutorWithStub constructs a BlobExecutor backed by the shared fake
+// newBlobExecutorWithStub constructs a blobExecutor backed by the shared fake
 // TTC streamer so BLOB tests can deterministically control protocol outcomes.
-func newBlobExecutorWithStub(s lobExecutorScenario) *BlobExecutor {
+func newBlobExecutorWithStub(s lobExecutorScenario) *blobExecutor {
 	shelf, _, _ := newLobTestShelf(8192)
 	stub := &fakeStreamer{
 		pushErr:   s.pushErr,
 		flushErr:  s.flushErr,
 		pullErr:   s.pullErr,
 		locator:   s.locator,
-		events:    make([]common.Message[common.MessageType], 0),
-		preHooks:  make(map[common.MessageType]StreamerPreUnmarshallCallback),
-		postHooks: make(map[common.MessageType]StreamerPostUnmarshallCallback),
+		events:    make([]driverCommon.Message[driverCommon.MessageType], 0),
+		preHooks:  make(map[driverCommon.MessageType]StreamerPreUnmarshallCallback),
+		postHooks: make(map[driverCommon.MessageType]StreamerPostUnmarshallCallback),
 		pullHook:  s.pullHook,
 	}
 	shelf.RegisterMessageStreamer(stub)
-	blob := NewBlobExecutor(shelf)
+	blob := newBlobExecutor(shelf)
 	stub.executor = blob.lobExecutor
 
 	if len(s.events) == 0 {
@@ -307,7 +371,7 @@ func newBlobExecutorWithStub(s lobExecutorScenario) *BlobExecutor {
 		if err != nil {
 			panic(err)
 		}
-		s.events = []common.Message[common.MessageType]{msg, &mockOer{}}
+		s.events = []driverCommon.Message[driverCommon.MessageType]{msg, &mockOer{}}
 	}
 	stub.events = append(stub.events, s.events...)
 	if s.onFlush != nil {

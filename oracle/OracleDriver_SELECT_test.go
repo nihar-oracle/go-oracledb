@@ -47,6 +47,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/oracle/go-oracledb/v26/oracle/lob"
 )
 
 // TestDriver_Table_Select creates the table, inserts a row, selects and decodes values, then cleans up.
@@ -329,8 +331,8 @@ func TestDriver_Prepared_InsertAndSelect_AllTypes(t *testing.T) {
 		tztOut  time.Time
 		bOut    bool
 		rOut    []byte
-		clobOut string
-		blobOut []byte
+		clobOut lob.Text
+		blobOut lob.Bytes
 	)
 	if err := selStmt.QueryRowContext(ctx, sql.Named("id", id)).
 		Scan(&idOut, &nOut, &vOut, &fOut, &dOut, &tsOut, &tztOut, &bOut, &rOut, &clobOut, &blobOut); err != nil {
@@ -350,7 +352,7 @@ func TestDriver_Prepared_InsertAndSelect_AllTypes(t *testing.T) {
 	if diff := math.Abs(fOut - f); diff > 1e-12 {
 		t.Fatalf("f_col mismatch: got %.15f want %.15f (diff=%.3g)", fOut, f, diff)
 	}
-	if clobOut != c {
+	if string(clobOut) != c {
 		t.Fatalf("c_col mismatch: got %s want %s", clobOut, c)
 	}
 
@@ -934,8 +936,8 @@ func TestDriver_Prepared_InsertMultipleRows_Re_exec(t *testing.T) {
 			tztOut  time.Time
 			bOut    bool
 			rOut    []byte
-			clobOut string
-			blobOut []byte
+			clobOut lob.Text
+			blobOut lob.Bytes
 		)
 		if err := rs.Scan(&idOut, &nOut, &vOut, &fOut, &dOut, &tsOut, &tztOut, &bOut, &rOut, &clobOut, &blobOut); err != nil {
 			t.Fatalf("scan failed: %v", err)
@@ -971,7 +973,7 @@ func TestDriver_Prepared_InsertMultipleRows_Re_exec(t *testing.T) {
 		if !bytes.Equal(rOut, exp.r) {
 			t.Fatalf("r_col mismatch for id=%d: got % X want % X", exp.id, rOut, exp.r)
 		}
-		if clobOut != exp.c {
+		if string(clobOut) != exp.c {
 			t.Fatalf("c_col mismatch for id=%d: got %q want %q", exp.id, clobOut, exp.c)
 		}
 		if !bytes.Equal(blobOut, exp.blob) {
@@ -1005,8 +1007,8 @@ func TestDriver_Prepared_InsertMultipleRows_Re_exec(t *testing.T) {
 			tztOut  time.Time
 			bOut    bool
 			rOut    []byte
-			clobOut string
-			blobOut []byte
+			clobOut lob.Text
+			blobOut lob.Bytes
 		)
 		if err := selStmt.QueryRowContext(ctx, sql.Named("id", exp.id)).
 			Scan(&idOut, &nOut, &vOut, &fOut, &dOut, &tsOut, &tztOut, &bOut, &rOut, &clobOut, &blobOut); err != nil {
@@ -1039,7 +1041,7 @@ func TestDriver_Prepared_InsertMultipleRows_Re_exec(t *testing.T) {
 		if !bytes.Equal(rOut, exp.r) {
 			t.Fatalf("r_col mismatch for id=%d: got % X want % X", exp.id, rOut, exp.r)
 		}
-		if clobOut != exp.c {
+		if string(clobOut) != exp.c {
 			t.Fatalf("c_col mismatch for id=%d: got %q want %q", exp.id, clobOut, exp.c)
 		}
 		if !bytes.Equal(blobOut, exp.blob) {

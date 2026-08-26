@@ -41,61 +41,64 @@ package ttc
 import (
 	"context"
 	"log/slog"
+	"math"
 
-	"github.com/oracle/go-driver/driver/common"
+	"github.com/oracle/go-oracledb/v26/internal/common"
+	driverCommon "github.com/oracle/go-oracledb/v26/internal/driver/common"
+	oracleErrors "github.com/oracle/go-oracledb/v26/oracle/errors"
 )
 
 const (
 	// blobFormOfUse identifies the form-of-use value used for binary LOB locators.
 	// Binary LOBs do not carry character semantics, so the value remains zero.
-	blobFormOfUse common.UB2 = 0
+	blobFormOfUse driverCommon.UB2 = 0
 
 	// blobCharsetIDPlaceholder supplies the non-zero charset value required by
 	// the OLOBOPS temporary-create protocol. It makes the charset pointer
 	// non-null but does not apply character conversion to BLOB data.
-	blobCharsetIDPlaceholder common.UB2 = 1
+	blobCharsetIDPlaceholder driverCommon.UB2 = 1
 )
 
-// BlobExecutor orchestrates BLOB operations on top of the shared lobExecutor.
+// blobExecutor orchestrates BLOB operations on top of the shared lobExecutor.
 // The executor intentionally keeps the API surface byte-oriented so higher
 // layers do not perform redundant conversions when streaming binary payloads.
-type BlobExecutor struct {
+type blobExecutor struct {
 	*lobExecutor
 }
 
-// NewBlobExecutor constructs a BlobExecutor using the supplied message shelf.
+// newBlobExecutor constructs a blobExecutor using the supplied message shelf.
 //
-// Inputs:
+// Parameters:
 //   - shelf: message shelf shared across TTC executors.
 //
-// Outputs:
-//   - *BlobExecutor: executor backed by the shared lobExecutor.
+// Returns:
+//   - *blobExecutor: executor backed by the shared lobExecutor.
 //
 // Errors:
 //   - None.
-func NewBlobExecutor(shelf *common.Shelf[common.MessageType]) *BlobExecutor {
+func newBlobExecutor(shelf *driverCommon.Shelf[driverCommon.MessageType]) *blobExecutor {
 	base := newLobExecutor()
-	base.SetShelf(shelf)
+	base.setShelf(shelf)
 
-	return &BlobExecutor{lobExecutor: base}
+	return &blobExecutor{lobExecutor: base}
 }
 
-// Open delegates to the shared lobExecutor while preventing unsupported BFILE
+// open delegates to the shared lobExecutor while preventing unsupported BFILE
 // open modes from slipping through the binary LOB path.
 //
-// Inputs:
+// Parameters:
 //   - ctx: request-scoped context for cancellation and deadlines.
 //   - lobLocator: BLOB locator to open.
-//   - mode: desired access mode, either LobOpenModeReadOnly or
-//     LobOpenModeReadWrite.
+//   - mode: desired access mode, either lobOpenModeReadOnly or
+//     lobOpenModeReadWrite.
 //
-// Outputs:
+// Returns:
 //   - bool: true when the locator was opened, or false when no state change was
 //     required.
 //   - error: nil when the operation succeeds.
 //
 // Errors:
-//   - Returns InvalidLOBBuffer for the BFILE-only read mode.
+//   - Returns UnsupportedLobOperation for the BFILE-only read mode.
 //   - Propagates validation, TTC, protocol, and network failures from the
 //     shared lobExecutor.
 //
@@ -103,92 +106,92 @@ func NewBlobExecutor(shelf *common.Shelf[common.MessageType]) *BlobExecutor {
 //   - Temporary and abstract locators are opened by updating their local
 //     locator flags.
 //   - Persistent locators are opened through an OLOBOPS round trip.
-func (b *BlobExecutor) Open(ctx context.Context, lobLocator *locator, mode LobOpenMode) (bool, error) {
-	if mode == BfileOpenModeReadOnly {
-		err := common.NewOracleError(common.InvalidLOBBuffer, nil, "open", "blob", "unsupported BFILE open mode")
-		common.Odl.Error("BlobExecutor.Open: invalid open mode", "mode", mode, "error", err)
+func (b *blobExecutor) open(ctx context.Context, lobLocator *locator, mode lobOpenMode) (bool, error) {
+	if mode == bfileOpenModeReadOnly {
+		err := common.NewOracleError(oracleErrors.UnsupportedLobOperation, nil, "BFILE open")
+		common.Odl.Error("blobExecutor.open: invalid open mode", "mode", mode, "error", err)
 		return false, err
 	}
 
 	return b.lobExecutor.open(ctx, lobLocator, mode)
 }
 
-// Close closes the locator and clears client side flags via the base executor.
+// close closes the locator and clears client side flags via the base executor.
 //
-// Inputs:
+// Parameters:
 //   - ctx: request-scoped context for cancellation and deadlines.
 //   - lobLocator: BLOB locator to close.
 //
-// Outputs:
+// Returns:
 //   - error: nil when the operation succeeds.
 //
 // Errors:
 //   - Propagates locator-state, TTC, protocol, and network failures from the
 //     shared lobExecutor.
-func (b *BlobExecutor) Close(ctx context.Context, lobLocator *locator) error {
+func (b *blobExecutor) close(ctx context.Context, lobLocator *locator) error {
 	return b.lobExecutor.close(ctx, lobLocator)
 }
 
-// GetChunkSize retrieves the server reported chunk (page) size for the locator.
+// getChunkSize retrieves the server reported chunk (page) size for the locator.
 //
-// Inputs:
+// Parameters:
 //   - ctx: request-scoped context for cancellation and deadlines.
 //   - lobLocator: BLOB locator whose storage chunk size is requested.
 //
-// Outputs:
-//   - common.UB8: chunk size in bytes reported by the server.
+// Returns:
+//   - driverCommon.UB8: chunk size in bytes reported by the server.
 //   - error: nil when the operation succeeds.
 //
 // Errors:
 //   - Propagates TTC, protocol, and network failures from the shared
 //     lobExecutor.
-func (b *BlobExecutor) GetChunkSize(ctx context.Context, lobLocator *locator) (common.UB8, error) {
-	return b.lobExecutor.GetChunkSize(ctx, lobLocator)
+func (b *blobExecutor) getChunkSize(ctx context.Context, lobLocator *locator) (driverCommon.UB8, error) {
+	return b.lobExecutor.getChunkSize(ctx, lobLocator)
 }
 
-// GetLength retrieves the server reported length for the supplied locator.
+// getLength retrieves the server reported length for the supplied locator.
 //
-// Inputs:
+// Parameters:
 //   - ctx: request-scoped context for cancellation and deadlines.
 //   - lobLocator: BLOB locator whose length is requested.
 //
-// Outputs:
-//   - common.UB8: BLOB length in bytes reported by the server.
+// Returns:
+//   - driverCommon.UB8: BLOB length in bytes reported by the server.
 //   - error: nil when the operation succeeds.
 //
 // Errors:
 //   - Propagates TTC, protocol, and network failures from the shared
 //     lobExecutor.
-func (b *BlobExecutor) GetLength(ctx context.Context, lobLocator *locator) (common.UB8, error) {
-	return b.lobExecutor.GetLength(ctx, lobLocator)
+func (b *blobExecutor) getLength(ctx context.Context, lobLocator *locator) (driverCommon.UB8, error) {
+	return b.lobExecutor.getLength(ctx, lobLocator)
 }
 
-// Trim truncates or extends the LOB to the provided length.
+// trim truncates or extends the LOB to the provided length.
 //
-// Inputs:
+// Parameters:
 //   - ctx: request-scoped context for cancellation and deadlines.
 //   - lobLocator: BLOB locator whose length should be changed.
 //   - newLength: desired BLOB length in bytes.
 //
-// Outputs:
-//   - common.UB8: resulting length in bytes reported by the server.
+// Returns:
+//   - driverCommon.UB8: resulting length in bytes reported by the server.
 //   - error: nil when the operation succeeds.
 //
 // Errors:
 //   - Returns InvalidLOBBuffer for value-based or read-only locators.
 //   - Propagates TTC, protocol, and network failures from the shared
 //     lobExecutor.
-func (b *BlobExecutor) Trim(ctx context.Context, lobLocator *locator, newLength common.UB8) (common.UB8, error) {
-	return b.lobExecutor.Trim(ctx, lobLocator, newLength)
+func (b *blobExecutor) trim(ctx context.Context, lobLocator *locator, newLength driverCommon.UB8) (driverCommon.UB8, error) {
+	return b.lobExecutor.trim(ctx, lobLocator, newLength)
 }
 
-// IsOpen interrogates the locator open state using the base executor helper.
+// isOpen interrogates the locator open state using the base executor helper.
 //
-// Inputs:
+// Parameters:
 //   - ctx: request-scoped context for cancellation and deadlines.
 //   - lobLocator: BLOB locator whose open state is requested.
 //
-// Outputs:
+// Returns:
 //   - bool: true when the locator is open.
 //   - error: nil when the operation succeeds.
 //
@@ -199,20 +202,20 @@ func (b *BlobExecutor) Trim(ctx context.Context, lobLocator *locator, newLength 
 // Behaviour:
 //   - Temporary and abstract locator state is read locally.
 //   - Persistent locator state is queried through an OLOBOPS round trip.
-func (b *BlobExecutor) IsOpen(ctx context.Context, lobLocator *locator) (bool, error) {
-	return b.lobExecutor.IsOpen(ctx, lobLocator)
+func (b *blobExecutor) isOpen(ctx context.Context, lobLocator *locator) (bool, error) {
+	return b.lobExecutor.isOpen(ctx, lobLocator)
 }
 
-// CreateTemporaryLob provisions a temporary BLOB locator.
+// createTemporaryLob provisions a temporary BLOB locator.
 //
-// Inputs:
+// Parameters:
 //   - ctx: request-scoped context for cancellation and deadlines.
 //   - cache: whether Oracle should place temporary BLOB data in the buffer
 //     cache.
 //   - duration: server duration hint for the temporary BLOB lifecycle.
 //
-// Outputs:
-//   - common.B1Array: locator bytes for the newly created temporary BLOB.
+// Returns:
+//   - driverCommon.B1Array: locator bytes for the newly created temporary BLOB.
 //   - error: nil when the operation succeeds.
 //
 // Errors:
@@ -223,12 +226,12 @@ func (b *BlobExecutor) IsOpen(ctx context.Context, lobLocator *locator) (bool, e
 //   - Temporary BLOBs use binary form-of-use and a non-zero charset placeholder
 //     required by OLOBOPS. The placeholder does not give binary data character
 //     semantics or trigger character conversion.
-func (b *BlobExecutor) CreateTemporaryLob(ctx context.Context, cache bool, duration common.UB4) (common.B1Array, error) {
+func (b *blobExecutor) createTemporaryLob(ctx context.Context, cache bool, duration driverCommon.UB4) (driverCommon.B1Array, error) {
 	tempSize := kolllTempWithSignature
-	def := NewLobDefinitionForTemporaryCreate(
+	def := newLobDefinitionForTemporaryCreate(
 		tempSize,
 		blobFormOfUse,
-		common.UB8(DtyBlob),
+		driverCommon.UB8(DtyBlob),
 		duration,
 		cache,
 		blobCharsetIDPlaceholder,
@@ -236,7 +239,7 @@ func (b *BlobExecutor) CreateTemporaryLob(ctx context.Context, cache bool, durat
 
 	if common.Odl.Enabled(ctx, slog.LevelDebug) {
 		common.Odl.Debug(
-			"BlobExecutor.CreateTemporaryLob: before execute",
+			"blobExecutor.createTemporaryLob: before execute",
 			"cache", cache,
 			"duration", duration,
 			"tempSize", tempSize,
@@ -245,7 +248,7 @@ func (b *BlobExecutor) CreateTemporaryLob(ctx context.Context, cache bool, durat
 	}
 
 	if err := b.lobExecutor.execute(ctx, def); err != nil {
-		common.Odl.Error("BlobExecutor.CreateTemporaryLob: execute failed",
+		common.Odl.Error("blobExecutor.createTemporaryLob: execute failed",
 			"error", err,
 			"operation", def.operation,
 		)
@@ -255,16 +258,16 @@ func (b *BlobExecutor) CreateTemporaryLob(ctx context.Context, cache bool, durat
 	return def.sourceLocator.locatorBytes, nil
 }
 
-// Write streams the supplied binary payload into the target locator using the
+// write streams the supplied binary payload into the target locator using the
 // shared lobExecutor.write helper.
 //
-// Inputs:
+// Parameters:
 //   - ctx: request-scoped context for cancellation and deadlines.
 //   - lobLocator: writable BLOB locator and byte offset for the operation.
 //   - data: raw bytes to write without character-set conversion.
 //
-// Outputs:
-//   - common.UB8: number of bytes reported written by the server.
+// Returns:
+//   - driverCommon.UB8: number of bytes reported written by the server.
 //   - error: nil when the operation succeeds.
 //
 // Errors:
@@ -275,40 +278,46 @@ func (b *BlobExecutor) CreateTemporaryLob(ctx context.Context, cache bool, durat
 // Buffer requirements:
 //   - The entire data slice is sent in this operation. Its length determines
 //     the OLOBOPS byte amount.
-func (b *BlobExecutor) Write(
+func (b *blobExecutor) write(
 	ctx context.Context,
 	lobLocator *locator,
-	data common.B1Array,
-) (common.UB8, error) {
-	return b.lobExecutor.write(ctx, lobLocator, data, common.UB8(len(data)))
+	data driverCommon.B1Array,
+) (driverCommon.UB8, error) {
+	return b.lobExecutor.write(ctx, lobLocator, data, driverCommon.UB8(len(data)))
 }
 
-// Read copies raw BLOB bytes from the locator into the caller-supplied buffer
-// using the shared lobExecutor.read helper.
+// read performs one BLOB locator read into a newly allocated, bounded
+// result buffer.
 //
-// Inputs:
-//   - ctx: request-scoped context for cancellation and deadlines.
-//   - lobLocator: readable BLOB locator and byte offset for the operation.
-//   - numBytes: maximum number of raw bytes requested from the server.
-//   - outBuffer: caller-owned destination for the returned bytes.
+// Parameters:
+//   - ctx: request context used for the TTC exchange.
+//   - lobLocator: locator and 1-based offset identifying the BLOB data to read.
+//   - amount: maximum number of bytes to request and destination-buffer capacity.
 //
-// Outputs:
-//   - common.UB8: number of bytes copied into outBuffer.
-//   - error: nil when the operation succeeds.
+// Returns:
+//   - []byte: bytes read from the locator. The slice owns the allocation made
+//     for this call; the executor does not retain, pool, or reuse it, so callers
+//     may retain or modify it.
+//   - driverCommon.UB8: number of bytes in the returned slice.
+//   - error: nil on success.
 //
 // Errors:
-//   - Propagates TTC, protocol, unmarshalling, and network failures from the
-//     shared lobExecutor.
+//   - Returns InvalidLOBBuffer when amount exceeds math.MaxInt, the largest Go
+//     int for the target architecture.
+//   - Returns LobExecError when a TTC protocol response exceeds the destination
+//     buffer or another underlying read-exchange error occurs.
 //
-// Buffer requirements:
-//   - len(outBuffer) should be at least numBytes. Supplying a smaller buffer can
-//     truncate a long CLR response or fail unmarshalling a short CLR response.
-//   - Only the returned number of bytes in outBuffer contain response data.
-func (b *BlobExecutor) Read(
-	ctx context.Context,
-	lobLocator *locator,
-	numBytes common.UB8,
-	outBuffer common.B1Array,
-) (common.UB8, error) {
-	return b.lobExecutor.read(ctx, lobLocator, numBytes, outBuffer)
+// Returning the allocated destination directly avoids a second allocation and
+// copy for every BLOB refill. The lower TTC callback verifies that protocol
+// frames cannot exceed the destination buffer.
+func (b *blobExecutor) read(ctx context.Context, lobLocator *locator, amount driverCommon.UB8) ([]byte, driverCommon.UB8, error) {
+	if amount > driverCommon.UB8(math.MaxInt) {
+		return nil, 0, common.NewOracleError(oracleErrors.InvalidLOBBuffer, nil, "read", "blob", "amount overflow")
+	}
+	buffer := make(driverCommon.B1Array, int(amount))
+	read, _, err := b.lobExecutor.read(ctx, lobLocator, amount, buffer)
+	if err != nil {
+		return nil, 0, err
+	}
+	return buffer[:int(read)], read, nil
 }

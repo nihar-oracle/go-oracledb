@@ -107,6 +107,7 @@ func (cn *connectionNegotiator) Negotiate(ctx context.Context) (*driverCommon.Se
 		negotiatedTTCVersion = clientVersion
 	}
 	common.Odl.Debug("Negotiated TTC version", "client version", clientVersion, "server version", serverVersion, "negotiated version", negotiatedTTCVersion)
+	shelf.setNegotiatedTTCVersion(negotiatedTTCVersion)
 
 	// set timezone version number in session context
 	sessCtx.SetTimeZoneVersionNumber(dty.GetTimeZoneVersionNumber())
