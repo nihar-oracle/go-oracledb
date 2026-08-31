@@ -48,7 +48,6 @@ import (
 	"time"
 
 	"github.com/oracle/go-oracledb/v26/internal/driver/common"
-	internallob "github.com/oracle/go-oracledb/v26/internal/lob"
 	oracleconfig "github.com/oracle/go-oracledb/v26/oracle/config"
 	oracleErrors "github.com/oracle/go-oracledb/v26/oracle/errors"
 )
@@ -120,6 +119,7 @@ func TestRowsResult_LocatorValueSurvivesRowsNext(t *testing.T) {
 	t.Parallel()
 	rows := newTTCRows([]columnContext{{DataType: DtyBlob}})
 	rows.shelf = newShelf[common.MessageType]()
+	rows.streamLobResults = true
 	rows.rowData = [][]common.B1Array{{common.B1Array("first")}, {common.B1Array("second")}}
 	rows.lobColContext = [][]*lobColumnContext{
 		{{locatorByteLength: 4, lobLocator: persistentTestLobLocator()}},
@@ -164,6 +164,7 @@ func TestRowsResult_ReaderModeRejectsTemporaryLocator(t *testing.T) {
 	t.Parallel()
 	rows := newTTCRows([]columnContext{{DataType: DtyBlob}})
 	rows.shelf = newShelf[common.MessageType]()
+	rows.streamLobResults = true
 	locatorBytes := persistentTestLobLocator()
 	locatorBytes[koll4FlagOffset] |= kolblTemporaryFlagByte
 	rows.rowData = [][]common.B1Array{{nil}}
@@ -192,6 +193,7 @@ func TestRowsResult_ReaderModePreservesEmptyNonNullLob(t *testing.T) {
 	t.Parallel()
 	rows := newTTCRows([]columnContext{{DataType: DtyBlob}})
 	rows.shelf = newShelf[common.MessageType]()
+	rows.streamLobResults = true
 	rows.rowData = [][]common.B1Array{{nil}}
 	rows.lobColContext = [][]*lobColumnContext{{{locatorByteLength: 0, lobLocator: persistentTestLobLocator()}}}
 	rows.numOfRows = 1
@@ -231,8 +233,34 @@ func TestRowsResult_MaterializedModePreservesEmptyNonNullClob(t *testing.T) {
 	if err := rows.Next(destination); err != nil {
 		t.Fatalf("Next returned error: %v", err)
 	}
-	if _, ok := destination[0].(internallob.LOBSource); !ok {
-		t.Fatalf("empty CLOB = %#v (%T), want locator source", destination[0], destination[0])
+	if value, ok := destination[0].(string); !ok || value != "" {
+		t.Fatalf("empty CLOB = %#v (%T), want empty string", destination[0], destination[0])
+	}
+}
+
+func TestRowsResult_MaterializedModeReturnsBlobBytes(t *testing.T) {
+	t.Parallel()
+	payload := common.B1Array("blob payload")
+	locator := persistentTestLobLocator()
+	rows := newTTCRows([]columnContext{{DataType: DtyBlob}})
+	rows.shelf = newShelf[common.MessageType]()
+	rows.rowData = [][]common.B1Array{{payload}}
+	rows.lobColContext = [][]*lobColumnContext{{{
+		locatorByteLength: common.UB4(len(locator)),
+		totalLobLength:    common.UB8(len(payload)),
+		lobLocator:        locator,
+	}}}
+	rows.numOfRows = 1
+	destination := make([]driver.Value, 1)
+	if err := rows.Next(destination); err != nil {
+		t.Fatalf("Next returned error: %v", err)
+	}
+	value, ok := destination[0].([]byte)
+	if !ok || !bytes.Equal(value, payload) {
+		t.Fatalf("BLOB = %#v (%T), want %x", destination[0], destination[0], payload)
+	}
+	if len(value) != 0 && &value[0] != &payload[0] {
+		t.Fatal("fully prefetched BLOB was copied inside the driver")
 	}
 }
 
@@ -480,8 +508,8 @@ func TestTTCRowsColumnTypeScanType(t *testing.T) {
 
 		{name: "RAW", dtype: DtyBin, want: reflect.TypeFor[[]byte]()},
 
-		{name: "CLOB", dtype: DtyClob, want: reflect.TypeFor[any]()},
-		{name: "BLOB", dtype: DtyBlob, want: reflect.TypeFor[any]()},
+		{name: "CLOB", dtype: DtyClob, want: reflect.TypeFor[string]()},
+		{name: "BLOB", dtype: DtyBlob, want: reflect.TypeFor[[]byte]()},
 
 		{name: "JSON", dtype: DtyJSON, want: reflect.TypeFor[string]()},
 	}
@@ -496,5 +524,11 @@ func TestTTCRowsColumnTypeScanType(t *testing.T) {
 					got, got.Kind(), tc.want, tc.want.Kind())
 			}
 		})
+	}
+
+	rows := buildTestTTCRows(true, DtyBlob, 0, nil)
+	rows.streamLobResults = true
+	if got := rows.ColumnTypeScanType(0); got != reflect.TypeFor[any]() {
+		t.Fatalf("streaming BLOB ColumnTypeScanType() = %v, want any", got)
 	}
 }

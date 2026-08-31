@@ -36,9 +36,9 @@
 ** SOFTWARE.
  */
 
-// Package lob provides the supported application API for streaming Oracle
-// BLOB, CLOB, and NCLOB values. TTC locators and connection ownership remain
-// private to the driver.
+// Package lob provides opt-in streaming APIs and materializing Scanner types
+// for Oracle BLOB, CLOB, and NCLOB values. TTC locators and connection
+// ownership remain private to the driver.
 package lob
 
 import (
@@ -68,11 +68,12 @@ const (
 	NCLOB = internallob.NCLOB
 )
 
-// LOB is a locator-backed BLOB, CLOB, or NCLOB query result. Scan a query
-// column into LOB to read it incrementally. It is valid only while its
-// producing Rows and Statement remain open; Rows.Close, Statement.Close, or
-// query context cancellation invalidates it. Rows.Next does not invalidate an
-// unread LOB, so applications may retain it while the result set remains open.
+// LOB is a locator-backed BLOB, CLOB, or NCLOB query result. Set
+// OracleDriverProperties.StreamLobResults before scanning a query column into
+// LOB. It is valid only while its producing Rows and Statement remain open.
+// Rows.Close, Statement.Close, or query context cancellation invalidates it.
+// Rows.Next does not invalidate an unread LOB, so applications may retain it
+// while the result set remains open.
 // Reaching EOF while iterating Rows automatically closes Rows. Read a retained
 // LOB before the iteration ends, or call OpenPersistent on the same dedicated
 // *sql.Conn before advancing past it when it must outlive Rows. OpenPersistent

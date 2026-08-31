@@ -40,7 +40,6 @@ package ttc
 
 import (
 	"bufio"
-	"bytes"
 	"context"
 	"database/sql/driver"
 	"errors"
@@ -186,7 +185,7 @@ func normalizeLobBindInputs(args []driver.NamedValue) []driver.NamedValue {
 func normalizeLobBindValue(value any) (internallob.Input, bool) {
 	switch value := value.(type) {
 	case internallob.BindBlob:
-		return internallob.NewInput(bytes.NewReader(value), internallob.BLOB, int64(len(value))), true
+		return internallob.NewBlobInput(value), true
 	case internallob.BindClob:
 		text := string(value)
 		return internallob.NewInput(strings.NewReader(text), internallob.CLOB, int64(len(text))), true
@@ -445,6 +444,23 @@ func sizedLobReader(input internallob.Input) (io.Reader, *io.LimitedReader) {
 //   - lobCleanupDisposition: safe cleanup action after an error.
 //   - error: input or write failure.
 func streamBlobInput(ctx context.Context, write func(context.Context, *locator, driverCommon.B1Array) (driverCommon.UB8, error), loc *locator, input internallob.Input) (lobCleanupDisposition, error) {
+	if payload, ok := input.BlobBytes(); ok {
+		if err := ctx.Err(); err != nil {
+			return lobCleanupFreeNow, common.NewOracleError(oracleErrors.InvalidLobInput, err, "BLOB context")
+		}
+		if len(payload) == 0 {
+			return lobCleanupFreeNow, nil
+		}
+		written, err := write(ctx, loc, driverCommon.B1Array(payload))
+		if err != nil {
+			return lobCleanupAfterRPC(err), err
+		}
+		if written != driverCommon.UB8(len(payload)) {
+			return lobCleanupFreeNow, common.NewOracleError(oracleErrors.InvalidLobInput, io.ErrShortWrite, "BLOB write")
+		}
+		loc.offset += written
+		return lobCleanupFreeNow, nil
+	}
 	reader, limited := sizedLobReader(input)
 	buffer := make([]byte, internallob.DefaultBlobLobChunkBytes)
 	for {

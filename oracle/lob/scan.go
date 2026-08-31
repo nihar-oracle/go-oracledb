@@ -60,16 +60,24 @@ type Bytes []byte
 // use a pointer or a separate nullable value when NULL must be represented.
 type Text string
 
-// Scan implements sql.Scanner for a BLOB query column. It fully reads the BLOB
-// into memory, assigns its bytes to value, and closes the locator-backed query
-// source. SQL NULL and non-BLOB sources are rejected.
+// Scan implements sql.Scanner for a BLOB query column. It accepts the driver's
+// compatibility []byte value or fully reads and closes a locator-backed source.
+// SQL NULL and non-BLOB sources are rejected.
 //
 // Parameters:
-//   - input: locator-backed BLOB source supplied by the driver.
+//   - input: materialized BLOB bytes or a locator-backed BLOB source.
 //
 // Returns:
 //   - error: scan, read, close, or source-validation error.
 func (value *Bytes) Scan(input any) error {
+	if data, ok := input.([]byte); ok {
+		if len(data) == 0 {
+			*value = Bytes{}
+			return nil
+		}
+		*value = append((*value)[:0], data...)
+		return nil
+	}
 	source, err := scanSource(input, BLOB)
 	if err != nil {
 		return err
@@ -82,17 +90,20 @@ func (value *Bytes) Scan(input any) error {
 	return nil
 }
 
-// Scan implements sql.Scanner for a CLOB or NCLOB query column. It fully reads
-// the LOB into memory as UTF-8 text, assigns it to value, and closes the
-// locator-backed query source. SQL NULL and non-character LOB sources are
-// rejected.
+// Scan implements sql.Scanner for a CLOB or NCLOB query column. It accepts the
+// driver's compatibility string value or fully reads and closes a
+// locator-backed source. SQL NULL and non-character LOB sources are rejected.
 //
 // Parameters:
-//   - input: locator-backed CLOB or NCLOB source supplied by the driver.
+//   - input: materialized text or a locator-backed CLOB or NCLOB source.
 //
 // Returns:
 //   - error: scan, read, close, or source-validation error.
 func (value *Text) Scan(input any) error {
+	if text, ok := input.(string); ok {
+		*value = Text(text)
+		return nil
+	}
 	source, err := scanSource(input, CLOB, NCLOB)
 	if err != nil {
 		return err

@@ -38,6 +38,7 @@
 package lob
 
 import (
+	"bytes"
 	"io"
 
 	"github.com/oracle/go-oracledb/v26/internal/common"
@@ -81,6 +82,8 @@ type Input struct {
 	kind Kind
 	// size is the exact source byte count.
 	size int64
+	// blob retains the caller's BLOB bytes for the zero-copy fast path.
+	blob []byte
 }
 
 // NewInput creates an exact-length private streamed-bind carrier.
@@ -94,6 +97,17 @@ type Input struct {
 //   - Input: carrier validated before its reader is consumed.
 func NewInput(reader io.Reader, kind Kind, size int64) Input {
 	return Input{reader: reader, kind: kind, size: size}
+}
+
+// NewBlobInput creates an exact-length BLOB carrier that retains the caller's
+// slice for a single write operation.
+func NewBlobInput(data []byte) Input {
+	return Input{
+		reader: bytes.NewReader(data),
+		kind:   BLOB,
+		size:   int64(len(data)),
+		blob:   data,
+	}
 }
 
 // Reader returns the application stream owned by the current execution.
@@ -113,6 +127,12 @@ func (input Input) Kind() Kind { return input.kind }
 // Returns:
 //   - int64: declared byte count.
 func (input Input) Size() int64 { return input.size }
+
+// BlobBytes returns the original BLOB bytes when this input was constructed
+// from the public in-memory marker.
+func (input Input) BlobBytes() ([]byte, bool) {
+	return input.blob, input.blob != nil
+}
 
 // ValidationError reports malformed private carrier state without reading it.
 //

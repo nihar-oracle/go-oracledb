@@ -125,6 +125,27 @@ func TestLobBindPipeline_StreamBlobInputIsBoundedAndHonorsDeclaredSize(t *testin
 	}
 }
 
+func TestLobBindPipeline_BindBlobUsesSingleZeroCopyWrite(t *testing.T) {
+	t.Parallel()
+	payload := bytes.Repeat([]byte{0xAB}, 2*internallob.DefaultBlobLobChunkBytes+7)
+	loc := newLocator(driverCommon.B1Array("locator"), 1)
+	calls := 0
+	write := func(_ context.Context, _ *locator, data driverCommon.B1Array) (driverCommon.UB8, error) {
+		calls++
+		if len(data) != len(payload) || &data[0] != &payload[0] {
+			t.Fatal("BindBlob payload was copied or split before the TTC write")
+		}
+		return driverCommon.UB8(len(data)), nil
+	}
+
+	if _, err := streamBlobInput(context.Background(), write, loc, internallob.NewBlobInput(payload)); err != nil {
+		t.Fatalf("streamBlobInput returned error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("TTC write calls = %d, want 1", calls)
+	}
+}
+
 // TestLobBindPipeline_NormalizeLobBindInputsConvertsMarkersToInputs verifies that every
 // public LOB marker enters the existing streamed-LOB bind path rather than a
 // LOB-specific executor or OAC registry path.
@@ -159,6 +180,12 @@ func TestLobBindPipeline_NormalizeLobBindInputsConvertsMarkersToInputs(t *testin
 			}
 			if input.Kind() != testCase.kind || input.Size() != int64(len(testCase.payload)) {
 				t.Fatalf("normalized LOB metadata = (%v, %d), want (%v, %d)", input.Kind(), input.Size(), testCase.kind, len(testCase.payload))
+			}
+			if blob, ok := testCase.value.(internallob.BindBlob); ok {
+				retained, retainedOK := input.BlobBytes()
+				if !retainedOK || len(retained) != len(blob) || &retained[0] != &blob[0] {
+					t.Fatal("normalized BindBlob did not retain the original bytes")
+				}
 			}
 			if got, err := io.ReadAll(input.Reader()); err != nil || !bytes.Equal(got, testCase.payload) {
 				t.Fatalf("normalized LOB reader = %v, %v; want %v, nil", got, err, testCase.payload)

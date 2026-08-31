@@ -105,6 +105,26 @@ func TestLOBScan_TextReadsCharacterKindsAndCloses(t *testing.T) {
 	}
 }
 
+func TestLOBScan_AcceptsMaterializedValues(t *testing.T) {
+	var binary Bytes
+	input := []byte{0, 1, 2, 255}
+	if err := binary.Scan(input); err != nil {
+		t.Fatalf("Bytes.Scan([]byte): %v", err)
+	}
+	input[0] = 9
+	if binary[0] != 0 {
+		t.Fatal("Bytes.Scan retained the driver's mutable row buffer")
+	}
+
+	var text Text
+	if err := text.Scan("Aé中🙂"); err != nil {
+		t.Fatalf("Text.Scan(string): %v", err)
+	}
+	if text != "Aé中🙂" {
+		t.Fatalf("Text = %q", text)
+	}
+}
+
 func TestLOBScan_RejectsNullAndWrongKind(t *testing.T) {
 	var binary Bytes
 	if err := binary.Scan(nil); err == nil {

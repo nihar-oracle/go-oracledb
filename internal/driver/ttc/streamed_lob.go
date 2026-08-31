@@ -170,8 +170,8 @@ func newStreamedLob(owner *ttcRows, dtype DtyType, prefix driverCommon.B1Array, 
 	default:
 		return nil, common.NewOracleError(oracleErrors.InvalidLobSource, nil, "TTC datatype")
 	}
-	if value.blob != nil && value.nextOffset-1 >= value.lengthValue {
-		value.eof = len(value.prefix) == 0
+	if value.lengthValue == 0 && len(value.prefix) == 0 {
+		value.eof = true
 	}
 	return value, nil
 }

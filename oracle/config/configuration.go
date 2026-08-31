@@ -69,6 +69,10 @@ type OracleDriverProperties struct {
 	//
 	// The default is 32 MiB.
 	DefaultLobPrefetchSize int `default:"33554432" validator:"validateZeroOrPositive"  help:"default prefetch size"`
+	// StreamLobResults returns BLOB, CLOB, and NCLOB query columns as
+	// locator-backed values for oracle/lob scanners. The compatibility default
+	// materializes BLOBs as []byte and character LOBs as strings.
+	StreamLobResults bool `default:"false" help:"if true, return locator-backed LOB query values"`
 }
 
 func (config OracleDriverProperties) String() string {
@@ -81,6 +85,10 @@ func (config OracleDriverProperties) IsStrictNullValueHandling() bool {
 
 func (config OracleDriverProperties) GetDefaultLobPrefetchSize() int {
 	return config.DefaultLobPrefetchSize
+}
+
+func (config OracleDriverProperties) IsLobStreamingEnabled() bool {
+	return config.StreamLobResults
 }
 
 // OracleConnectionProperties contains Oracle Net connection properties used to

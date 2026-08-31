@@ -200,7 +200,7 @@ func TestDriver_LobTableSelectBlob(t *testing.T) {
 
 	// Select back (small)
 	selSQL := fmt.Sprintf("SELECT bin FROM %s WHERE id = :id", table)
-	var outSmall lob.Bytes
+	var outSmall []byte
 	if err := db.QueryRowContext(ctx, selSQL, sql.Named("id", int64(1))).Scan(&outSmall); err != nil {
 		t.Fatalf("select/scan small blob failed: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestDriver_LobTableSelectBlob(t *testing.T) {
 	}
 
 	// Select back (large) - compare hash
-	var outLarge lob.Bytes
+	var outLarge []byte
 	if err := db.QueryRowContext(ctx, selSQL, sql.Named("id", int64(2))).Scan(&outLarge); err != nil {
 		t.Fatalf("select/scan large blob failed: %v", err)
 	}

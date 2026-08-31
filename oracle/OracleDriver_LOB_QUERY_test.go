@@ -64,7 +64,7 @@ func TestDriver_LocatorBackedLOBQueryLifecycle(t *testing.T) {
 		t.Skip("No configuration available")
 	}
 
-	db, err := openTestDBWithConfig(TestingConfig)
+	db, err := openStreamingTestDBWithConfig(TestingConfig)
 	if err != nil {
 		t.Fatalf("open test DB: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestDriver_LobQueryLocatorSurvivesRowsNext(t *testing.T) {
 		t.Skip("No configuration available")
 	}
 
-	db, err := openLobPrefetchTestDB(TestingConfig, functionalLobPrefetchSize)
+	db, err := openLobPrefetchTestDB(TestingConfig, functionalLobPrefetchSize, true)
 	if err != nil {
 		t.Fatalf("open test DB: %v", err)
 	}

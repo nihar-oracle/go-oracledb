@@ -57,7 +57,7 @@ func TestDriver_LobDirectPersistentWriteTo(t *testing.T) {
 		t.Skip("No configuration available")
 	}
 
-	db, err := openTestDBWithConfig(TestingConfig)
+	db, err := openStreamingTestDBWithConfig(TestingConfig)
 	if err != nil {
 		t.Fatalf("open test DB: %v", err)
 	}

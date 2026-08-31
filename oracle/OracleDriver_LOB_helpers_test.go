@@ -39,6 +39,8 @@
 package oracle
 
 import (
+	"database/sql"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -51,4 +53,29 @@ func createLOBObjectName(t *testing.T) string {
 	t.Helper()
 	logicalName := strings.NewReplacer("/", "_", " ", "_", "-", "_").Replace(strings.ToLower(t.Name()))
 	return createObjectName(logicalName)
+}
+
+func openStreamingTestDBWithConfig(cfg *TestConfig) (*sql.DB, error) {
+	if cfg == nil {
+		return nil, sql.ErrConnDone
+	}
+	dsn := cfg.GetConnectionString()
+	separator := "?"
+	if strings.Contains(dsn, "?") {
+		separator = "&"
+	}
+	if value := strings.TrimSpace(cfg.ConnectionProperties.StrictNullValueHandling); value != "" {
+		dsn += fmt.Sprintf("%voracle.go.DriverProperties.StrictNullValueHandling=%s", separator, value)
+		separator = "&"
+	}
+	dsn = fmt.Sprintf("%s%voracle.go.DriverProperties.StreamLobResults=true", dsn, separator)
+	db, err := sql.Open(cfg.Driver.Name, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
 }
