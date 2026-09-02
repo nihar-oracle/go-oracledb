@@ -422,6 +422,13 @@ func TestTokenCacheRefreshRetentionAndPruning(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertPrivateKeyMatchesRequest(t, firstKey, client.request(0))
+	firstByte := firstKey[0]
+	firstKey[0] ^= 0xFF
+	retainedKey, err := provider.PrivateKeyForToken(context.Background(), first)
+	if err != nil || retainedKey[0] != firstByte {
+		t.Fatalf("retained key was changed through a returned slice: %v", err)
+	}
+	firstKey[0] = firstByte
 
 	now = now.Add(5 * time.Minute)
 	token, err = provider.Token(context.Background())
@@ -613,9 +620,13 @@ func TestRefreshDoesNotBlockRetainedKeyLookupOrCancellation(t *testing.T) {
 	retainedToken := jwtToken(t, now.Add(10*time.Minute))
 	retainedKey := newTestKey(t)
 	provider.token = retainedToken
+	retainedKeyPEM, err := marshalPrivateKey(retainedKey)
+	if err != nil {
+		t.Fatalf("marshal retained key: %v", err)
+	}
 	provider.expires = now.Add(time.Minute)
 	provider.generations = map[[sha256.Size]byte]tokenGeneration{
-		sha256.Sum256([]byte(retainedToken)): {key: retainedKey, expires: now.Add(10 * time.Minute)},
+		sha256.Sum256([]byte(retainedToken)): {privateKeyPEM: retainedKeyPEM, expires: now.Add(10 * time.Minute)},
 	}
 
 	refreshResult := make(chan error, 1)

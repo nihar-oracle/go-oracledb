@@ -38,7 +38,16 @@ registrar.RegisterProvider(provider)
 db := sql.OpenDB(connector)
 ```
 
-The imports in the example are `database/sql`, `fmt`, `github.com/oracle/go-oracledb/v26/oracle`, `github.com/oracle/go-oracledb/v26/oracle/providers`, and `github.com/oracle/go-oracledb/providers/oci`.
+The generic registration interface remains in the versioned driver module,
+while the OCI implementation is independently versioned:
+
+```go
+import (
+    "github.com/oracle/go-oracledb/v26/oracle"
+    driverproviders "github.com/oracle/go-oracledb/v26/oracle/providers"
+    ociprovider "github.com/oracle/go-oracledb/providers/oci"
+)
+```
 
 ## Token and key lifecycle
 
