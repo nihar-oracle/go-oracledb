@@ -216,6 +216,8 @@ func jwtToken(t *testing.T, expires time.Time) string {
 	return "header." + base64.RawURLEncoding.EncodeToString(payload) + ".signature"
 }
 
+// TestConfigNormalization verifies trimming, scope derivation, explicit scope
+// precedence, and required principal/profile fields.
 func TestConfigNormalization(t *testing.T) {
 	validScope := "urn:oracle:db::id::scope"
 	cases := []struct {
@@ -267,6 +269,8 @@ func TestConfigNormalization(t *testing.T) {
 	}
 }
 
+// TestProviderConfigurationModes verifies all supported principal factories,
+// profile arguments, derived scope, and region forwarding.
 func TestProviderConfigurationModes(t *testing.T) {
 	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
 	configuration := testConfigurationProvider{key: newTestKey(t), region: "us-phoenix-1"}
@@ -325,6 +329,8 @@ func TestProviderConfigurationModes(t *testing.T) {
 	}
 }
 
+// TestProviderConstructionErrors verifies principal and client factory
+// failures, including invalid nil results from injected factories.
 func TestProviderConstructionErrors(t *testing.T) {
 	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
 	configuration := testConfigurationProvider{key: newTestKey(t), region: "us-phoenix-1"}
@@ -398,6 +404,8 @@ func TestProviderConstructionErrors(t *testing.T) {
 	}
 }
 
+// TestTokenCacheRefreshRetentionAndPruning verifies cache reuse, refresh,
+// exact key retention across generations, and expiry-based pruning.
 func TestTokenCacheRefreshRetentionAndPruning(t *testing.T) {
 	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
 	firstExpiration := now.Add(10 * time.Minute)
@@ -492,6 +500,8 @@ func assertPrivateKeyMatchesRequest(t *testing.T, privatePEM []byte, request ide
 	}
 }
 
+// TestTokenErrors verifies OCI request failures and empty, malformed, missing-
+// expiry, and already-expired token responses.
 func TestTokenErrors(t *testing.T) {
 	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
 	clientError := errors.New("OCI unavailable")
@@ -528,6 +538,8 @@ func TestTokenErrors(t *testing.T) {
 	}
 }
 
+// TestTokenKeyAndContextErrors verifies key-generation failures, cancellation,
+// unknown token rejection, and invalid private-key inputs.
 func TestTokenKeyAndContextErrors(t *testing.T) {
 	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
 	keyError := errors.New("randomness unavailable")
@@ -575,6 +587,8 @@ func TestTokenKeyAndContextErrors(t *testing.T) {
 	}
 }
 
+// TestProviderConcurrency verifies concurrent callers share one token refresh
+// and receive the same cached generation.
 func TestProviderConcurrency(t *testing.T) {
 	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
 	token := jwtToken(t, now.Add(time.Hour))
@@ -608,6 +622,8 @@ func TestProviderConcurrency(t *testing.T) {
 	}
 }
 
+// TestRefreshDoesNotBlockRetainedKeyLookupOrCancellation verifies a slow
+// refresh does not block valid key lookup or prevent waiter cancellation.
 func TestRefreshDoesNotBlockRetainedKeyLookupOrCancellation(t *testing.T) {
 	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
 	refreshedToken := jwtToken(t, now.Add(time.Hour))
@@ -651,6 +667,8 @@ func TestRefreshDoesNotBlockRetainedKeyLookupOrCancellation(t *testing.T) {
 	}
 }
 
+// TestJWTExpirationAndDataplaneRegion verifies JWT expiration parsing, RSA key
+// generation, principal wrappers, region override, and refreshability.
 func TestJWTExpirationAndDataplaneRegion(t *testing.T) {
 	expires := time.Date(2026, 8, 31, 1, 0, 0, 0, time.UTC)
 	got, err := jwtExpiration(jwtToken(t, expires))
