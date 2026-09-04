@@ -11,7 +11,18 @@ This module obtains OCI IAM scoped-access tokens for Oracle Database token authe
 - `oci.OKEWorkloadIdentity`
 - `oci.ConfigProfile`
 
-For `ConfigProfile`, set `ConfigProfile`; `ConfigFile` is optional and defaults to the OCI SDK configuration-file location. Set `Scope` to use an explicit scoped-access-token scope. Otherwise, `CompartmentOCID` and `DatabaseOCID` derive the database scope as `urn:oracle:db::id::<compartment>::<database>`. `Region` overrides the region reported by the selected principal.
+For `ConfigProfile`, set `ConfigProfile`; `ConfigFile` is optional and defaults
+to the OCI SDK configuration-file location. `Region` overrides the region
+reported by the selected principal.
+
+Set `Scope` to use an explicit database-token scope. Explicit scopes must use
+the documented `urn:oracle:db::id::` or `urn:oracle:db::path::` family and may
+not contain whitespace or control characters. Otherwise, `CompartmentOCID` and
+`DatabaseOCID` derive
+`urn:oracle:db::id::<compartment>::<database>`.
+
+`RefreshBeforeExpiry` controls how early the current token is replaced. Zero
+uses the default five-minute window; negative values are rejected.
 
 ## Connector usage
 
@@ -21,6 +32,7 @@ provider, err := oci.New(oci.Config{
     CompartmentOCID: compartmentOCID,
     DatabaseOCID:    databaseOCID,
     Region:          "us-ashburn-1", // optional
+    RefreshBeforeExpiry: 2 * time.Minute, // optional; zero uses five minutes
 })
 if err != nil {
     return err
@@ -43,9 +55,11 @@ while the OCI implementation is independently versioned:
 
 ```go
 import (
+    "time"
+
+    "github.com/oracle/go-oracledb/providers/oci"
     "github.com/oracle/go-oracledb/v26/oracle"
-    driverproviders "github.com/oracle/go-oracledb/v26/oracle/providers"
-    ociprovider "github.com/oracle/go-oracledb/providers/oci"
+    "github.com/oracle/go-oracledb/v26/oracle/providers"
 )
 ```
 

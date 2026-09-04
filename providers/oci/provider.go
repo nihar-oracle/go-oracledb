@@ -55,13 +55,14 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/oracle/oci-go-sdk/v65/common"
 	"github.com/oracle/oci-go-sdk/v65/common/auth"
 	"github.com/oracle/oci-go-sdk/v65/identitydataplane"
 )
 
-const refreshWindow = 5 * time.Minute
+const defaultRefreshBeforeExpiry = 5 * time.Minute
 
 // Principal identifies the OCI IAM principal used to obtain scoped database
 // access tokens.
@@ -91,6 +92,9 @@ type Config struct {
 	// Scope explicitly selects the scoped-access-token scope. It takes
 	// precedence over CompartmentOCID and DatabaseOCID.
 	Scope string
+	// RefreshBeforeExpiry controls how early Token refreshes the current token.
+	// Zero uses the default five-minute window. Negative values are rejected.
+	RefreshBeforeExpiry time.Duration
 	// Region overrides the region reported by the selected principal.
 	Region string
 	// ConfigFile selects an OCI configuration file when Principal is
@@ -105,12 +109,14 @@ type Config struct {
 // associated with every returned token until that token expires.
 type Provider struct {
 	// mu protects token, expires, generations, refreshing, and refreshDone.
-	// client, scope, now, and newKey are immutable after construction.
+	// client, scope, refreshBeforeExpiry, now, and newKey are immutable after construction.
 	mu sync.Mutex
 	// client issues signed OCI IAM scoped-access-token requests.
 	client scopedTokenClient
 	// scope is the normalized scope included in every token request.
 	scope string
+	// refreshBeforeExpiry controls how early a cached token is replaced.
+	refreshBeforeExpiry time.Duration
 	// token is the newest successfully issued token.
 	token string
 	// expires is token's expiration time.
@@ -153,8 +159,10 @@ type tokenGeneration struct {
 	expires time.Time
 }
 
-// dependencies isolates external factories plus time and key generation so
-// token lifecycle tests remain deterministic and offline.
+// dependencies is a private dependency-injection bundle used only by
+// newProvider. New supplies production implementations; tests replace them
+// with deterministic clocks, keys, clients, and principal factories so every
+// lifecycle and failure path runs offline without sleeping or contacting OCI.
 type dependencies struct {
 	// now supplies the current time.
 	now func() time.Time
@@ -271,10 +279,11 @@ func newProvider(config Config, deps dependencies) (*Provider, error) {
 		return nil, fmt.Errorf("create OCI identity data plane client: client is nil")
 	}
 	return &Provider{
-		client: client,
-		scope:  config.Scope,
-		now:    deps.now,
-		newKey: deps.newKey,
+		client:              client,
+		scope:               config.Scope,
+		refreshBeforeExpiry: config.RefreshBeforeExpiry,
+		now:                 deps.now,
+		newKey:              deps.newKey,
 	}, nil
 }
 
@@ -291,6 +300,12 @@ func (config Config) normalized() (Config, error) {
 	config.Region = strings.TrimSpace(config.Region)
 	config.ConfigFile = strings.TrimSpace(config.ConfigFile)
 	config.ConfigProfile = strings.TrimSpace(config.ConfigProfile)
+	if config.RefreshBeforeExpiry < 0 {
+		return Config{}, fmt.Errorf("OCI IAM database token provider requires non-negative RefreshBeforeExpiry")
+	}
+	if config.RefreshBeforeExpiry == 0 {
+		config.RefreshBeforeExpiry = defaultRefreshBeforeExpiry
+	}
 
 	switch config.Principal {
 	case InstancePrincipal, ResourcePrincipal, OKEWorkloadIdentity, ConfigProfile:
@@ -308,10 +323,46 @@ func (config Config) normalized() (Config, error) {
 		}
 		config.Scope = fmt.Sprintf("urn:oracle:db::id::%s::%s", config.CompartmentOCID, config.DatabaseOCID)
 	}
+	if err := validateDatabaseScope(config.Scope); err != nil {
+		return Config{}, err
+	}
 	if config.Principal == ConfigProfile && config.ConfigProfile == "" {
 		return Config{}, fmt.Errorf("OCI IAM config_profile principal requires ConfigProfile")
 	}
 	return config, nil
+}
+
+// validateDatabaseScope accepts the documented OCI database-token ID and path
+// URN families while leaving resource-specific authorization to OCI.
+//
+// Parameters:
+//   - scope: normalized explicit or derived token scope.
+//
+// Returns:
+//   - error: unsupported prefix, empty target, whitespace, or control character.
+func validateDatabaseScope(scope string) error {
+	const (
+		idPrefix   = "urn:oracle:db::id::"
+		pathPrefix = "urn:oracle:db::path::"
+	)
+	target := ""
+	switch {
+	case strings.HasPrefix(scope, idPrefix):
+		target = strings.TrimPrefix(scope, idPrefix)
+	case strings.HasPrefix(scope, pathPrefix):
+		target = strings.TrimPrefix(scope, pathPrefix)
+	default:
+		return fmt.Errorf("OCI IAM database token scope must use %q or %q", idPrefix, pathPrefix)
+	}
+	if target == "" {
+		return fmt.Errorf("OCI IAM database token scope requires a target")
+	}
+	if strings.IndexFunc(scope, func(value rune) bool {
+		return unicode.IsSpace(value) || unicode.IsControl(value)
+	}) >= 0 {
+		return fmt.Errorf("OCI IAM database token scope must not contain whitespace or control characters")
+	}
+	return nil
 }
 
 // configurationProvider selects the configured OCI principal factory. The
@@ -418,7 +469,7 @@ func (provider *Provider) Token(ctx context.Context) (string, error) {
 		}
 		provider.mu.Lock()
 		now := provider.now()
-		if provider.token != "" && now.Add(refreshWindow).Before(provider.expires) {
+		if provider.token != "" && now.Add(provider.refreshBeforeExpiry).Before(provider.expires) {
 			token := provider.token
 			provider.mu.Unlock()
 			return token, nil

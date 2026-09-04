@@ -58,6 +58,8 @@ import (
 	"github.com/oracle/oci-go-sdk/v65/identitydataplane"
 )
 
+const testScope = "urn:oracle:db::id::scope"
+
 var _ interface {
 	Token(context.Context) (string, error)
 	PrivateKeyForToken(context.Context, string) ([]byte, error)
@@ -200,7 +202,7 @@ func testDependencies(now *time.Time, client scopedTokenClient, t *testing.T) de
 
 func newTestProvider(t *testing.T, now *time.Time, client scopedTokenClient) *Provider {
 	t.Helper()
-	provider, err := newProvider(Config{Principal: InstancePrincipal, Scope: "test-scope"}, testDependencies(now, client, t))
+	provider, err := newProvider(Config{Principal: InstancePrincipal, Scope: testScope}, testDependencies(now, client, t))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -219,17 +221,20 @@ func jwtToken(t *testing.T, expires time.Time) string {
 // TestConfigNormalization verifies trimming, scope derivation, explicit scope
 // precedence, and required principal/profile fields.
 func TestConfigNormalization(t *testing.T) {
-	validScope := "urn:oracle:db::id::scope"
 	cases := []struct {
 		name   string
 		config Config
 		want   string
 	}{
-		{name: "missing principal", config: Config{Scope: validScope}, want: "requires Principal"},
-		{name: "unsupported principal", config: Config{Principal: "other", Scope: validScope}, want: "unsupported OCI IAM principal"},
+		{name: "missing principal", config: Config{Scope: testScope}, want: "requires Principal"},
+		{name: "unsupported principal", config: Config{Principal: "other", Scope: testScope}, want: "unsupported OCI IAM principal"},
 		{name: "missing compartment", config: Config{Principal: InstancePrincipal}, want: "requires CompartmentOCID"},
 		{name: "missing database", config: Config{Principal: InstancePrincipal, CompartmentOCID: "compartment"}, want: "requires DatabaseOCID"},
-		{name: "profile missing profile", config: Config{Principal: ConfigProfile, Scope: validScope}, want: "requires ConfigProfile"},
+		{name: "profile missing profile", config: Config{Principal: ConfigProfile, Scope: testScope}, want: "requires ConfigProfile"},
+		{name: "negative refresh window", config: Config{Principal: InstancePrincipal, Scope: testScope, RefreshBeforeExpiry: -time.Second}, want: "non-negative RefreshBeforeExpiry"},
+		{name: "invalid scope family", config: Config{Principal: InstancePrincipal, Scope: "scope"}, want: "must use"},
+		{name: "empty scope target", config: Config{Principal: InstancePrincipal, Scope: "urn:oracle:db::id::"}, want: "requires a target"},
+		{name: "scope whitespace", config: Config{Principal: InstancePrincipal, Scope: "urn:oracle:db::id::bad scope"}, want: "must not contain whitespace"},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -255,13 +260,20 @@ func TestConfigNormalization(t *testing.T) {
 	if config.Scope != "urn:oracle:db::id::compartment::database" {
 		t.Fatalf("derived scope = %q", config.Scope)
 	}
+	if config.RefreshBeforeExpiry != defaultRefreshBeforeExpiry {
+		t.Fatalf("default refresh window = %v", config.RefreshBeforeExpiry)
+	}
 
-	config, err = (Config{Principal: ResourcePrincipal, Scope: " explicit "}).normalized()
+	config, err = (Config{
+		Principal:           ResourcePrincipal,
+		Scope:               " urn:oracle:db::path::tenancy:compartment ",
+		RefreshBeforeExpiry: time.Minute,
+	}).normalized()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if config.Scope != "explicit" {
-		t.Fatalf("explicit scope = %q", config.Scope)
+	if config.Scope != "urn:oracle:db::path::tenancy:compartment" || config.RefreshBeforeExpiry != time.Minute {
+		t.Fatalf("explicit config = %#v", config)
 	}
 
 	if _, err := New(Config{}); err == nil {
@@ -279,10 +291,10 @@ func TestProviderConfigurationModes(t *testing.T) {
 		config      Config
 		wantFactory string
 	}{
-		{name: "instance", config: Config{Principal: InstancePrincipal, Scope: "scope"}, wantFactory: "instance"},
-		{name: "resource", config: Config{Principal: ResourcePrincipal, Scope: "scope"}, wantFactory: "resource"},
-		{name: "workload", config: Config{Principal: OKEWorkloadIdentity, Scope: "scope"}, wantFactory: "workload"},
-		{name: "profile", config: Config{Principal: ConfigProfile, Scope: "scope", ConfigFile: " file ", ConfigProfile: " profile "}, wantFactory: "profile"},
+		{name: "instance", config: Config{Principal: InstancePrincipal, Scope: testScope}, wantFactory: "instance"},
+		{name: "resource", config: Config{Principal: ResourcePrincipal, Scope: testScope}, wantFactory: "resource"},
+		{name: "workload", config: Config{Principal: OKEWorkloadIdentity, Scope: testScope}, wantFactory: "workload"},
+		{name: "profile", config: Config{Principal: ConfigProfile, Scope: testScope, ConfigFile: " file ", ConfigProfile: " profile "}, wantFactory: "profile"},
 	}
 	for _, test := range cases {
 		t.Run(test.name, func(t *testing.T) {
@@ -322,7 +334,7 @@ func TestProviderConfigurationModes(t *testing.T) {
 			} else if factory != test.wantFactory {
 				t.Fatalf("factory = %q, want %q", factory, test.wantFactory)
 			}
-			if provider.scope != "scope" {
+			if provider.scope != testScope {
 				t.Fatalf("scope = %q", provider.scope)
 			}
 		})
@@ -343,7 +355,7 @@ func TestProviderConstructionErrors(t *testing.T) {
 	}{
 		{
 			name:   "instance principal",
-			config: Config{Principal: InstancePrincipal, Scope: "scope"},
+			config: Config{Principal: InstancePrincipal, Scope: testScope},
 			deps: func(deps dependencies) dependencies {
 				deps.instancePrincipal = func() (common.ConfigurationProvider, error) { return nil, factoryError }
 				return deps
@@ -352,7 +364,7 @@ func TestProviderConstructionErrors(t *testing.T) {
 		},
 		{
 			name:   "resource principal",
-			config: Config{Principal: ResourcePrincipal, Scope: "scope"},
+			config: Config{Principal: ResourcePrincipal, Scope: testScope},
 			deps: func(deps dependencies) dependencies {
 				deps.resourcePrincipal = func() (common.ConfigurationProvider, error) { return nil, factoryError }
 				return deps
@@ -361,7 +373,7 @@ func TestProviderConstructionErrors(t *testing.T) {
 		},
 		{
 			name:   "workload identity",
-			config: Config{Principal: OKEWorkloadIdentity, Scope: "scope"},
+			config: Config{Principal: OKEWorkloadIdentity, Scope: testScope},
 			deps: func(deps dependencies) dependencies {
 				deps.workloadIdentity = func() (common.ConfigurationProvider, error) { return nil, factoryError }
 				return deps
@@ -370,7 +382,7 @@ func TestProviderConstructionErrors(t *testing.T) {
 		},
 		{
 			name:   "client",
-			config: Config{Principal: ConfigProfile, Scope: "scope", ConfigProfile: "DEFAULT"},
+			config: Config{Principal: ConfigProfile, Scope: testScope, ConfigProfile: "DEFAULT"},
 			deps: func(deps dependencies) dependencies {
 				deps.configProfile = func(string, string) common.ConfigurationProvider { return configuration }
 				deps.newClient = func(common.ConfigurationProvider, string) (scopedTokenClient, error) { return nil, factoryError }
@@ -391,16 +403,50 @@ func TestProviderConstructionErrors(t *testing.T) {
 
 	deps := testDependencies(&now, &recordingClient{}, t)
 	deps.newClient = func(common.ConfigurationProvider, string) (scopedTokenClient, error) { return nil, nil }
-	if _, err := newProvider(Config{Principal: InstancePrincipal, Scope: "scope"}, deps); err == nil || !strings.Contains(err.Error(), "client is nil") {
+	if _, err := newProvider(Config{Principal: InstancePrincipal, Scope: testScope}, deps); err == nil || !strings.Contains(err.Error(), "client is nil") {
 		t.Fatalf("newProvider() error = %v, want nil client error", err)
 	}
+
 	deps = testDependencies(&now, &recordingClient{}, t)
 	deps.instancePrincipal = func() (common.ConfigurationProvider, error) { return nil, nil }
-	if _, err := newProvider(Config{Principal: InstancePrincipal, Scope: "scope"}, deps); err == nil || !strings.Contains(err.Error(), "provider is nil") {
+	if _, err := newProvider(Config{Principal: InstancePrincipal, Scope: testScope}, deps); err == nil || !strings.Contains(err.Error(), "provider is nil") {
 		t.Fatalf("newProvider() error = %v, want nil configuration provider error", err)
 	}
 	if _, err := configurationProvider(Config{Principal: "unsupported"}, testDependencies(&now, &recordingClient{}, t)); err == nil {
 		t.Fatal("configurationProvider accepted unsupported principal")
+	}
+}
+
+// TestRefreshBeforeExpiry verifies a custom refresh lead time controls cache
+// reuse without changing the default.
+func TestRefreshBeforeExpiry(t *testing.T) {
+	now := time.Date(2026, 8, 31, 0, 0, 0, 0, time.UTC)
+	first := jwtToken(t, now.Add(10*time.Minute))
+	second := jwtToken(t, now.Add(20*time.Minute))
+	client := &recordingClient{results: []tokenResult{
+		{token: first, tokenSet: true},
+		{token: second, tokenSet: true},
+	}}
+	provider, err := newProvider(
+		Config{Principal: InstancePrincipal, Scope: testScope, RefreshBeforeExpiry: time.Minute},
+		testDependencies(&now, client, t),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if token, err := provider.Token(context.Background()); err != nil || token != first {
+		t.Fatalf("first Token() = %q, %v", token, err)
+	}
+	now = now.Add(8 * time.Minute)
+	if token, err := provider.Token(context.Background()); err != nil || token != first {
+		t.Fatalf("cached Token() = %q, %v", token, err)
+	}
+	now = now.Add(time.Minute)
+	if token, err := provider.Token(context.Background()); err != nil || token != second {
+		t.Fatalf("refreshed Token() = %q, %v", token, err)
+	}
+	if client.callCount() != 2 {
+		t.Fatalf("token requests = %d, want 2", client.callCount())
 	}
 }
 
@@ -483,7 +529,7 @@ func assertPrivateKeyMatchesRequest(t *testing.T, privatePEM []byte, request ide
 	if !ok {
 		t.Fatalf("private key type = %T", privateKey)
 	}
-	if request.GenerateScopedAccessTokenDetails.Scope == nil || *request.GenerateScopedAccessTokenDetails.Scope != "test-scope" {
+	if request.GenerateScopedAccessTokenDetails.Scope == nil || *request.GenerateScopedAccessTokenDetails.Scope != testScope {
 		t.Fatalf("request scope = %v", request.GenerateScopedAccessTokenDetails.Scope)
 	}
 	publicBlock, _ := pem.Decode([]byte(*request.GenerateScopedAccessTokenDetails.PublicKey))
@@ -545,7 +591,7 @@ func TestTokenKeyAndContextErrors(t *testing.T) {
 	keyError := errors.New("randomness unavailable")
 	deps := testDependencies(&now, &recordingClient{}, t)
 	deps.newKey = func() (*rsa.PrivateKey, error) { return nil, keyError }
-	provider, err := newProvider(Config{Principal: InstancePrincipal, Scope: "scope"}, deps)
+	provider, err := newProvider(Config{Principal: InstancePrincipal, Scope: testScope}, deps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -555,7 +601,7 @@ func TestTokenKeyAndContextErrors(t *testing.T) {
 
 	deps = testDependencies(&now, &recordingClient{}, t)
 	deps.newKey = func() (*rsa.PrivateKey, error) { return nil, nil }
-	provider, err = newProvider(Config{Principal: InstancePrincipal, Scope: "scope"}, deps)
+	provider, err = newProvider(Config{Principal: InstancePrincipal, Scope: testScope}, deps)
 	if err != nil {
 		t.Fatal(err)
 	}
